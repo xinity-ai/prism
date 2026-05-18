@@ -1,0 +1,48 @@
+{
+  "name": "@xinity/prism",
+  "version": "0.1.0",
+  "description": "Prism — OpenAI-compatible optimizing inference proxy. Self-Consistency, Best-of-N, PlanSearch, RTO, Memory (WiM), DeepConf, plus privacy/readurls/json plugins.",
+  "type": "module",
+  "module": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "bin": {
+    "prism": "./bin/prism.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/xinity-ai/prism.git"
+  },
+  "private": true,
+  "files": [
+    "src",
+    "bin",
+    "DESIGN.md",
+    "README.md"
+  ],
+  "engines": {
+    "bun": ">=1.3.0"
+  },
+  "scripts": {
+    "typecheck": "bun tsc --noEmit",
+    "test": "bun test",
+    "test:unit": "bun test tests/unit",
+    "test:integration": "bun test tests/integration",
+    "test:evals": "XINITY_RUN_EVALS=1 bun test tests/evals"
+  },
+  "dependencies": {
+    "eventsource-parser": "^3.0.0",
+    "rxjs": "^7.8.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.0",
+    "typescript": "^5.5.0"
+  }
+}
