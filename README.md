@@ -1,4 +1,12 @@
-# Prism · `@xinity/prism`
+<p align="center">
+  <img src="docs/assets/prism-logo.png" alt="Prism" width="320" />
+</p>
+
+<p align="center">
+  <strong><code>@xinity/prism</code></strong> · OpenAI-compatible optimizing inference proxy for self-hosted reasoning models
+</p>
+
+---
 
 An OpenAI-compatible optimizing inference proxy for self-hosted reasoning models. Sits between your applications and a vLLM / Ollama / SGLang / llama.cpp endpoint, applies inference-time techniques (self-consistency, plan-search, round-trip, best-of-n, memory, deep-conf), and exposes the same `/v1/chat/completions` surface your existing OpenAI SDK clients already speak.
 
