@@ -28,6 +28,21 @@ describe('normalizeAnswer', () => {
   test('lowercases and collapses whitespace and trailing punctuation', () => {
     expect(normalizeAnswer('  Hello,  World!  ')).toBe('hello world');
   });
+  test('collapses **bold** markers', () => {
+    expect(normalizeAnswer('**42**')).toBe('42');
+    expect(normalizeAnswer('the answer is **42**')).toBe(normalizeAnswer('the answer is 42'));
+  });
+  test('strips $$...$$ math blocks entirely so derivations do not fragment the vote', () => {
+    const withDerivation = '6 times 7 is **42**. $$6 \\times 7 = 42$$';
+    const withoutDerivation = '6 times 7 is **42**';
+    expect(normalizeAnswer(withDerivation)).toBe(normalizeAnswer(withoutDerivation));
+  });
+  test('strips \\[...\\] LaTeX display math', () => {
+    expect(normalizeAnswer('answer: 7 \\[x = 7\\]')).toBe(normalizeAnswer('answer: 7'));
+  });
+  test('strips ```math``` fenced blocks', () => {
+    expect(normalizeAnswer('answer 42\n```math\nx=42\n```')).toBe(normalizeAnswer('answer 42'));
+  });
 });
 
 describe('defaultVoter', () => {

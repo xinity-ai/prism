@@ -28,10 +28,32 @@ export function extractFinalAnswer(content: string): string {
   return trimmed;
 }
 
-/** Normalize a candidate answer for equality comparison. */
+/**
+ * Normalize a candidate answer for equality comparison.
+ *
+ * Strips two classes of variability that fragment otherwise-equivalent answers
+ * into different hash buckets:
+ *  - **Math blocks** (`$$ … $$`, `\[ … \]`, fenced ```math` / ```latex` / ```tex` `):
+ *    the model "showing its work" alongside a prose answer. Removed entirely
+ *    (delimiters and content), since a correct answer and a wrong derivation
+ *    can co-exist in one response and we want to vote on the *claim*, not the
+ *    derivation.
+ *  - **Emphasis markers** (`**`, `__`, `*`, `_`, `` ` ``): keep the content,
+ *    drop the markers, so `**42**` and `42` hash identically.
+ */
 export function normalizeAnswer(text: string): string {
   return text
     .toLowerCase()
+    // strip display-math blocks entirely
+    .replace(/\$\$[\s\S]*?\$\$/g, ' ')
+    .replace(/\\\[[\s\S]*?\\\]/g, ' ')
+    // strip math-tagged fenced code blocks entirely
+    .replace(/```(?:math|latex|tex)\b[\s\S]*?```/gi, ' ')
+    // strip emphasis / code markers but keep their content
+    .replace(/\*+/g, '')
+    .replace(/_+/g, '')
+    .replace(/`+/g, '')
+    // collapse whitespace and commas to single spaces
     .replace(/[\s,]+/g, ' ')
     .trim()
     .replace(/[.!?]+$/g, '')
