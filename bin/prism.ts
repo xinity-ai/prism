@@ -1,7 +1,47 @@
 #!/usr/bin/env bun
-import { createGateway } from '../src/index.ts';
+import {
+  createGateway,
+  selfConsistency,
+  bestOfN,
+  roundTrip,
+  planSearch,
+  memory,
+  deepConf,
+  privacy,
+  readUrls,
+  regexVerifier,
+} from '../src/index.ts';
+import type { Technique, Transform } from '../src/index.ts';
 
 const VERSION = '0.1.0';
+
+/**
+ * Default registry wired into the CLI gateway.
+ *
+ * Techniques that take a verifier (bestOfN) need one supplied at construction
+ * time, so we default it to a permissive regex matcher. Users running their
+ * own bestOfN via programmatic API pass a real verifier; the CLI default is
+ * mainly so the technique resolves without erroring on a stray header.
+ */
+const builtInTechniques: Record<string, (options?: unknown) => Technique> = {
+  'self-consistency': (o) => selfConsistency((o as Record<string, unknown>) ?? {}),
+  'round-trip':       (o) => roundTrip((o as Record<string, unknown>) ?? {}),
+  'plan-search':      (o) => planSearch((o as Record<string, unknown>) ?? {}),
+  'memory':           (o) => memory((o as Record<string, unknown>) ?? {}),
+  'deep-conf':        (o) => deepConf({ mode: 'offline', ...((o as Record<string, unknown>) ?? {}) } as Parameters<typeof deepConf>[0]),
+  'best-of-n':        (o) => bestOfN({
+    n: 3,
+    ...((o as Record<string, unknown>) ?? {}),
+    verifier: regexVerifier({ pattern: /.+/ }),
+  } as Parameters<typeof bestOfN>[0]),
+};
+
+const builtInTransforms: Record<string, (options?: unknown) => Transform> = {
+  'privacy':   () => privacy(),
+  'read-urls': () => readUrls(),
+  // `json` requires a Zod schema, so it can't be defaulted from a header alone.
+  // Users wanting JSON-enforcement should compose it programmatically.
+};
 
 type Args = {
   port: number;
@@ -77,6 +117,14 @@ const gateway = createGateway({
   upstream: {
     baseUrl: parsed.upstream,
     ...(parsed.apiKey !== undefined && { apiKey: parsed.apiKey }),
+  },
+  modelProfiles: [
+    { match: /qwen3|deepseek-r1|thinking/i, thinkingMode: true, supportsLogprobs: false, contextWindow: 32_000 },
+    { match: /.*/, thinkingMode: false, supportsLogprobs: false },
+  ],
+  registry: {
+    techniques: new Map(Object.entries(builtInTechniques)),
+    transforms: new Map(Object.entries(builtInTransforms)),
   },
 });
 
