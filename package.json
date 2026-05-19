@@ -33,9 +33,9 @@
     "url": "git+https://github.com/xinity-ai/prism.git"
   },
   "type": "module",
-  "main": "./dist/index.js",
-  "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -44,7 +44,7 @@
     }
   },
   "bin": {
-    "prism": "./dist/bin/prism.js"
+    "prism": "dist/bin/prism.js"
   },
   "files": [
     "dist",
