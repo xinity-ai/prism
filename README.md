@@ -68,6 +68,8 @@ Bun gives us native `fetch`, `Bun.serve`, native SQLite, and a built-in test run
 
 ## Quickstart
 
+> Requires **Bun ≥ 1.3**. Node compatibility is on the v0.2 roadmap.
+
 ### As a server
 
 ```bash
@@ -173,3 +175,7 @@ Prism is built and maintained by [Xinity](https://xinity.ai/), the sovereign on-
 If you would rather not run, monitor, and tune this yourself, [Xinity Control Center](https://github.com/xinity-ai/xinity-ai) is the managed product around it: model serving, fleet management, multi-tenant isolation, audit logging, regulatory reporting, and ongoing technique tuning against your benchmarks. The relationship is the standard open-core one, the gateway is fully usable on its own, and the commercial product is the rest of the stack around it.
 
 Reach out at [xinity.ai](https://xinity.ai/)
+
+## License
+
+[Apache License 2.0](LICENSE). Use it commercially, fork it, embed it in proprietary products — the license covers all of that. See `LICENSE` for the full text.

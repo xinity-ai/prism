@@ -2,39 +2,70 @@
   "name": "@xinity/prism",
   "version": "0.1.0",
   "description": "Prism — OpenAI-compatible optimizing inference proxy. Self-Consistency, Best-of-N, PlanSearch, RTO, Memory (WiM), DeepConf, plus privacy/readurls/json plugins.",
+  "keywords": [
+    "llm",
+    "openai",
+    "openai-compatible",
+    "inference",
+    "proxy",
+    "gateway",
+    "self-consistency",
+    "best-of-n",
+    "plan-search",
+    "deepconf",
+    "round-trip",
+    "memory",
+    "writing-in-the-margins",
+    "self-hosted",
+    "vllm",
+    "ollama",
+    "sglang",
+    "bun"
+  ],
+  "homepage": "https://github.com/xinity-ai/prism#readme",
+  "bugs": {
+    "url": "https://github.com/xinity-ai/prism/issues"
+  },
+  "license": "Apache-2.0",
+  "author": "Xinity AI <hello@xinity.ai> (https://xinity.ai)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xinity-ai/prism.git"
+  },
   "type": "module",
-  "module": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./src/index.ts",
-      "import": "./src/index.ts",
-      "default": "./src/index.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     }
   },
   "bin": {
-    "prism": "./bin/prism.ts"
+    "prism": "./dist/bin/prism.js"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+ssh://git@github.com/xinity-ai/prism.git"
-  },
-  "private": true,
   "files": [
-    "src",
-    "bin",
-    "DESIGN.md",
-    "README.md"
+    "dist",
+    "README.md",
+    "LICENSE",
+    "DESIGN.md"
   ],
   "engines": {
     "bun": ">=1.3.0"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "typecheck": "bun tsc --noEmit",
     "test": "bun test",
     "test:unit": "bun test tests/unit",
     "test:integration": "bun test tests/integration",
-    "test:evals": "XINITY_RUN_EVALS=1 bun test tests/evals"
+    "build": "rm -rf dist && bun build src/index.ts --target=bun --outdir=dist --packages=external && bun build bin/prism.ts --target=bun --outdir=dist/bin --packages=external && bun tsc -p tsconfig.build.json && bun run scripts/fix-dts-extensions.ts",
+    "prepublishOnly": "bun run typecheck && bun test tests/unit && bun run build",
+    "release": "npm version patch && git push --follow-tags && npm publish"
   },
   "dependencies": {
     "eventsource-parser": "^3.0.0",
