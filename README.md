@@ -12,6 +12,8 @@
   <strong><code>@xinity/prism</code> >> inspired by <a href="https://github.com/codelion/optillm"><code>codelion/optillm</code></a></strong>
 </p>
 
+<p align="center"><strong>Get started:</strong> <code>bun add <a href="https://www.npmjs.com/package/@xinity/prism">@xinity/prism</a></code></p>
+
 ---
 
 An OpenAI-compatible optimizing inference proxy for self-hosted reasoning models. Sits between your applications and a Xinity / vLLM / Ollama / SGLang / llama.cpp endpoint, applies inference-time techniques (self-consistency, plan-search, round-trip, best-of-n, memory, deep-conf), and exposes the same `/v1/chat/completions` surface your existing OpenAI SDK clients already speak.
