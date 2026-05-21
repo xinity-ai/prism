@@ -1,4 +1,5 @@
 import { htmlToText } from '../internal/html-to-text.ts';
+import { hasUrlsInMessages } from '../internal/detection.ts';
 import type { FetchLike } from '../upstream.ts';
 import type { ChatRequest, Message, Transform } from '../types.ts';
 
@@ -34,6 +35,9 @@ export function readUrls(options: ReadUrlsOptions = {}): Transform {
 
   return {
     name: 'read-urls',
+    shouldActivate(request) {
+      return hasUrlsInMessages(request.messages);
+    },
     async pre(request, state) {
       const urls = extractUrls(request.messages).slice(0, maxUrls);
       if (urls.length === 0) return request;

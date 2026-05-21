@@ -104,3 +104,22 @@ export type { UnitTestVerifierOptions } from './verifiers/unit-test.ts';
 
 // Voting helpers
 export { defaultVoter, extractFinalAnswer, normalizeAnswer } from './internal/voting.ts';
+
+// Routing (v0.2)
+export {
+  rule,
+  rulesRouter,
+  composeRouters,
+  defaultRules,
+  assertRouterConformance,
+  verifierRegistry,
+} from './router.ts';
+export type {
+  Router,
+  RouterContext,
+  RouterDecision,
+  Rule,
+  RuleInput,
+  PartialDecision,
+} from './router.ts';
+export type { VerifierRegistry } from './types.ts';

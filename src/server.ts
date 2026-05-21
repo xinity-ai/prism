@@ -1,4 +1,4 @@
-import { resolveConfig, type Registry } from './config.ts';
+import { resolveConfig, type Registry, type ResolvedConfig } from './config.ts';
 import { createJsonLogger } from './logging.ts';
 import { resolveModelProfile } from './model-profile.ts';
 import { pipelineRun } from './pipeline.ts';
@@ -12,6 +12,7 @@ import {
   toWireResponse,
 } from './types.ts';
 import type {
+  ChatRequest,
   ChatResponse,
   Logger,
   ModelProfile,
@@ -19,8 +20,10 @@ import type {
   Technique,
   Transform,
   UpstreamClient,
+  VerifierRegistry,
   XinityConfig,
 } from './types.ts';
+import type { Router } from './router.ts';
 
 export type GatewayConfig = {
   upstream: HttpUpstreamConfig | UpstreamClient;
@@ -28,11 +31,36 @@ export type GatewayConfig = {
   modelProfiles?: ModelProfile[];
   registry?: Partial<Registry>;
   logger?: Logger;
+  /**
+   * v0.2 — Router for automatic technique selection. When set, requests
+   * without explicit `xinity.techniques` are routed through this. Initialized
+   * lazily on first request; closed via `Gateway.close()` or `serve().stop()`.
+   */
+  router?: Router;
+  /**
+   * v0.2 — when true, default plugins (those registered via
+   * `defaults.plugins`) are included in each request's pipeline only if their
+   * `shouldActivate` predicate returns true. Plugins supplied explicitly per
+   * request are unaffected.
+   */
+  autoActivatePlugins?: boolean;
+  /**
+   * v0.2 — verifier registry forwarded to the Router via `RouterContext.verifiers`.
+   * Used by rules that want to pair a verifier with a technique (e.g.,
+   * `planSearch` + `unit-test`). Optional; rules tolerate an empty registry.
+   */
+  verifiers?: VerifierRegistry;
 };
 
 export type Gateway = {
   fetch: (req: Request) => Promise<Response>;
   serve: (opts: { port?: number; hostname?: string }) => Promise<{ url: string; stop: () => Promise<void> }>;
+  /**
+   * Release router resources. Idempotent. Called automatically by
+   * `serve().stop()`. For `fetch`-only deployments, call this explicitly at
+   * shutdown.
+   */
+  close: () => Promise<void>;
 };
 
 export function createGateway(config: GatewayConfig): Gateway {
@@ -44,6 +72,36 @@ export function createGateway(config: GatewayConfig): Gateway {
   const registry: Registry = {
     techniques: new Map(config.registry?.techniques),
     transforms: new Map(config.registry?.transforms),
+  };
+
+  // Router lifecycle. init() runs once (lazily on first request), memoized as
+  // a Promise so concurrent requests share the same warmup.
+  let routerInitPromise: Promise<void> | null = null;
+  const ensureRouterInit = async (): Promise<void> => {
+    const router = config.router;
+    if (!router || !router.init) return;
+    if (!routerInitPromise) {
+      const start = performance.now();
+      routerInitPromise = (async () => {
+        await router.init!();
+        logger.info({
+          event: 'router.init',
+          router: router.name,
+          duration_ms: Math.round((performance.now() - start) * 1000) / 1000,
+        });
+      })();
+    }
+    await routerInitPromise;
+  };
+
+  let closed = false;
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    if (config.router?.close) {
+      await config.router.close();
+      logger.info({ event: 'router.close', router: config.router.name });
+    }
   };
 
   async function handle(req: Request): Promise<Response> {
@@ -90,16 +148,42 @@ export function createGateway(config: GatewayConfig): Gateway {
     const modelProfile = resolveModelProfile(resolved.resolvedModel, profiles, resolved.modelProfileName);
     const wantsStream = wireReq.stream === true;
 
+    // ---- Resolve techniques per the four-case merge table (DESIGN §17.9) ---
+    let techniques: Technique[];
+    try {
+      techniques = await resolveTechniques({
+        resolved,
+        request: internalReq,
+        router: config.router,
+        verifiers: config.verifiers,
+        modelProfile,
+        logger: requestLogger,
+        signal: controller.signal,
+        ensureRouterInit,
+      });
+    } catch (err) {
+      return errorToResponse(err);
+    }
+
+    // ---- Resolve transforms with optional auto-activation ------------------
+    const transforms = resolveTransforms({
+      resolved,
+      request: internalReq,
+      modelProfile,
+      autoActivatePlugins: config.autoActivatePlugins === true,
+      logger: requestLogger,
+    });
+
     requestLogger.info({
       event: 'request.received',
       model: resolved.resolvedModel,
-      techniques: resolved.techniques.map(t => t.name),
-      plugins: resolved.transforms.map(t => t.name),
+      techniques: techniques.map(t => t.name),
+      plugins: transforms.map(t => t.name),
       stream: wantsStream,
     });
 
     // ---- Pass-through fast path: zero techniques + zero plugins -------------
-    if (resolved.techniques.length === 0 && resolved.transforms.length === 0) {
+    if (techniques.length === 0 && transforms.length === 0) {
       try {
         const raw = await upstream.raw(internalReq, controller.signal);
         return new Response(raw.body, { status: raw.status, headers: forwardHeaders(raw.headers) });
@@ -111,8 +195,8 @@ export function createGateway(config: GatewayConfig): Gateway {
     // ---- Active pipeline ---------------------------------------------------
     if (wantsStream) {
       return runStreaming({
-        techniques: resolved.techniques,
-        transforms: resolved.transforms,
+        techniques,
+        transforms,
         request: internalReq,
         upstream,
         modelProfile,
@@ -124,8 +208,8 @@ export function createGateway(config: GatewayConfig): Gateway {
     try {
       const response = await pipelineRun({
         request: internalReq,
-        techniques: resolved.techniques,
-        transforms: resolved.transforms,
+        techniques,
+        transforms,
         upstream,
         modelProfile,
         logger: requestLogger,
@@ -139,15 +223,113 @@ export function createGateway(config: GatewayConfig): Gateway {
 
   return {
     fetch: handle,
+    close,
     async serve({ port = 4000, hostname = '0.0.0.0' }) {
       const server = Bun.serve({ port, hostname, fetch: handle });
       logger.info({ event: 'server.listening', url: `http://${hostname}:${server.port}` });
       return {
         url: `http://${hostname}:${server.port}`,
-        async stop() { await server.stop(); },
+        async stop() {
+          await server.stop();
+          await close();
+        },
       };
     },
   };
+}
+
+// =============================================================================
+// Resolution helpers (DESIGN §17.9 merge semantics)
+// =============================================================================
+
+type ResolveTechniquesArgs = {
+  resolved: ResolvedConfig;
+  request: ChatRequest;
+  router?: Router;
+  verifiers?: VerifierRegistry;
+  modelProfile: ModelProfile;
+  logger: Logger;
+  signal: AbortSignal;
+  ensureRouterInit: () => Promise<void>;
+};
+
+async function resolveTechniques(args: ResolveTechniquesArgs): Promise<Technique[]> {
+  const { resolved, router, logger } = args;
+
+  // Case 1 & 2: per-request techniques are explicit. Use them as-is. If a
+  // router is also configured, log that we bypassed it.
+  if (resolved.techniquesFromRequest) {
+    if (router) {
+      logger.info({ event: 'router.bypassed', reason: 'explicit xinity.techniques in request' });
+    }
+    return resolved.techniques;
+  }
+
+  // Case 3: no explicit techniques, router configured — route.
+  if (router) {
+    await args.ensureRouterInit();
+    const start = performance.now();
+    const decision = await router.decide(args.request, {
+      modelProfile: args.modelProfile,
+      ...(resolved.effortBudget !== undefined && { effortBudget: resolved.effortBudget }),
+      signal: args.signal,
+      logger,
+      ...(args.verifiers !== undefined && { verifiers: args.verifiers }),
+    });
+    logger.info({
+      event: 'router.decision',
+      router: router.name,
+      techniques: decision.techniques.map(t => t.name),
+      reason: decision.reason,
+      confidence: decision.confidence ?? null,
+      duration_ms: Math.round((performance.now() - start) * 1000) / 1000,
+    });
+    return [...decision.techniques];
+  }
+
+  // Case 4: no explicit techniques, no router. Use server defaults (may be empty).
+  logger.info({
+    event: 'router.fallback',
+    source: 'server.defaults',
+    techniques: resolved.techniques.map(t => t.name),
+  });
+  return resolved.techniques;
+}
+
+type ResolveTransformsArgs = {
+  resolved: ResolvedConfig;
+  request: ChatRequest;
+  modelProfile: ModelProfile;
+  autoActivatePlugins: boolean;
+  logger: Logger;
+};
+
+function resolveTransforms(args: ResolveTransformsArgs): Transform[] {
+  const { resolved, request, modelProfile, autoActivatePlugins, logger } = args;
+
+  // Auto-activation applies only when:
+  //   - the flag is on
+  //   - the request did not supply plugins explicitly (explicit beats automation)
+  // Plugins without a `shouldActivate` predicate are always included.
+  if (!autoActivatePlugins || resolved.pluginsFromRequest) {
+    return resolved.transforms;
+  }
+
+  const out: Transform[] = [];
+  for (const t of resolved.transforms) {
+    if (!t.shouldActivate) {
+      out.push(t);
+      continue;
+    }
+    const active = t.shouldActivate(request, modelProfile);
+    if (active) {
+      out.push(t);
+      logger.info({ event: 'plugin.auto-activated', plugin: t.name });
+    } else {
+      logger.info({ event: 'plugin.auto-skipped', plugin: t.name, reason: 'shouldActivate returned false' });
+    }
+  }
+  return out;
 }
 
 type StreamingArgs = {

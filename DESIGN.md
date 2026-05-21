@@ -925,4 +925,816 @@ A `requestId` is generated per request (UUID v7 if Bun supports natively, else v
 3. **Streaming conflict → quiet degrade.** When `stream: true` and any active technique has `supportsStreaming: false`, the gateway runs non-streaming, emits `xinity.*` progress events as SSE, then emits the final response as a single delta chunk + `[DONE]`. No strict mode in v1.
 4. **DeepConf upstream constraint.** Documented in the README. The capability gate (`requiresLogprobs && !modelProfile.supportsLogprobs → 400`) enforces it at request time; no further server-side handling needed.
 
+## 17. Routing and auto-activation (v0.2)
+
+**Status:** Draft v1
+**Adds to:** `DESIGN.md` v1 (sections 1–16, shipped as part of v0.1)
+**Scope:** v0.2 only. The semantic router (`@xinity/prism-router-semantic`) is mentioned for interface-design purposes but is NOT in scope for this section or this release.
+
+---
+
+### 17.1 Purpose
+
+v0.1 shipped without any routing: techniques and plugins had to be enabled explicitly per request or via server defaults. v0.2 adds two independent mechanisms for automatic selection:
+
+1. **Auto-activating plugins.** Each plugin can decide for itself whether it applies to a given request based on a structural predicate over the request shape (PII present, URLs present, schema present). When enabled, plugins self-activate via this predicate.
+2. **The `Router` interface.** A pluggable component that selects which techniques to apply. The v0.2 release ships one implementation in core (`rulesRouter`). A future v0.3 release will ship a separate package (`@xinity/prism-router-semantic`) with a ModernBERT-based ML implementation conforming to the same interface.
+
+These two mechanisms are deliberately independent. They are not a unified "routing system." Conflating them was rejected during design (see 17.10).
+
+### 17.2 Design principles
+
+1. **Plugins self-activate; techniques are routed.** Plugin triggers are structural and local to each plugin. Technique selection is judgmental and global. The asymmetry is intentional.
+2. **The Router interface is the contract.** Both the v0.2 rule-based implementation and the v0.3 semantic implementation conform to a single `Router` interface. The interface is designed to support both up front and is frozen after Phase 1 of this work.
+3. **Rules are functions, not config.** No DSL, no priorities, no deactivation logic. Rules compose by simple left-to-right evaluation; the final decision is the union of what fires.
+4. **Explicit beats implicit.** A request with explicit `xinity.techniques` bypasses the router entirely. The router only runs when the user hasn't already decided.
+5. **Backwards compatibility is mandatory.** A v0.1 gateway config (no `router`, no `autoActivatePlugins`) behaves identically in v0.2.
+6. **The interface enables but does not encode composition.** `composeRouters` exists in core but is one combinator, not a framework. Users can write their own.
+
+### 17.3 The `Router` interface
+
+This is the single most important type in v0.2 and is the contract `@xinity/prism-router-semantic` (separate package, v0.3) will implement without modification.
+
+```typescript
+export interface Router {
+  readonly name: string;
+
+  /**
+   * Decide which techniques to apply to a request.
+   *
+   * MUST honor `signal` for cancellation. Semantic router calls may take 50-100ms;
+   * rule-based calls are sub-millisecond. The interface treats them uniformly.
+   *
+   * MUST be safe to call in parallel for concurrent requests. Any state is owned
+   * by the implementation; the context is read-only.
+   *
+   * MUST NOT mutate `request` or `context`.
+   *
+   * MAY return an empty technique array — "no router-selected techniques for this
+   * request, fall back to defaults".
+   */
+  decide(
+    request: ChatRequest,
+    context: RouterContext,
+  ): Promise<RouterDecision>;
+
+  /**
+   * Optional lifecycle hook for warmup. Called once at gateway startup.
+   *
+   * Rule-based router implements as a no-op (or omits entirely).
+   * Semantic router will load the ONNX model and tokenizer here.
+   *
+   * If absent, the router is assumed ready immediately.
+   */
+  init?(): Promise<void>;
+
+  /**
+   * Optional teardown hook. Called on graceful gateway shutdown.
+   * Use to release sessions, model handles, file descriptors.
+   */
+  close?(): Promise<void>;
+}
+
+export interface RouterContext {
+  readonly modelProfile: ModelProfile;
+
+  /**
+   * Optional cost/quality knob: 0.0 = cheapest acceptable pipeline,
+   * 1.0 = strongest pipeline regardless of cost.
+   *
+   * Routers SHOULD respect this when present:
+   * - Rule-based: rule predicates may check effortBudget to gate expensive
+   *   techniques. The default rule set uses thresholds 0.3, 0.4, 0.5.
+   * - Semantic (v0.3): passed as a feature into the classifier head.
+   *
+   * Defaults to 0.5 when omitted (rule-based interpretation).
+   */
+  readonly effortBudget?: number;
+
+  readonly signal: AbortSignal;
+  readonly logger: Logger;
+}
+
+export interface RouterDecision {
+  /**
+   * Techniques to apply, in composition order (outer-most first).
+   *
+   * Empty array = "no techniques" — pipeline forwards request to upstream as-is
+   * unless server defaults supply techniques.
+   */
+  readonly techniques: Technique[];
+
+  /**
+   * Human-readable explanation. Logged at info level for every routed request.
+   *
+   * Rule-based: "matched rules: memory-for-long-input, self-consistency-default"
+   * Semantic: "classifier predicted [self-consistency, memory] with confidence 0.83"
+   */
+  readonly reason: string;
+
+  /**
+   * Optional confidence score in [0, 1].
+   *
+   * Rule-based router returns `undefined` (rules are deterministic; confidence
+   * is not meaningful). Semantic router returns the classifier's softmax
+   * confidence.
+   *
+   * The pipeline uses this for fallback decisions when set: below 0.5, the
+   * pipeline MAY fall back to server defaults instead of the router's choice.
+   * Threshold is configurable in v0.3.
+   */
+  readonly confidence?: number;
+}
+```
+
+#### 17.3.1 Interface validation walkthrough
+
+Before declaring the interface done in Phase 1, the design walks through three implementations to confirm fit:
+
+**Rule-based (v0.2, this release):**
+- `init` / `close` omitted (no resources)
+- `decide` evaluates each rule's `when`, accumulates `apply` outputs, concatenates techniques, joins reason strings, returns confidence `undefined`
+- Synchronous internally; wrapped in `Promise.resolve` for interface uniformity
+- ✓ Fits
+
+**Semantic (v0.3, separate package):**
+- `init` loads ONNX session and tokenizer (~2s on first call)
+- `decide` tokenizes prompt, runs forward pass, maps predicted label(s) to Technique instances via a registry, returns techniques + reason + classifier confidence
+- Parallel-safe via either per-call session creation or session pooling (implementation choice)
+- `close` releases session
+- ✓ Fits
+
+**Hypothetical LLM-as-router (never to be built):**
+- `init` validates upstream client
+- `decide` makes a small LLM call asking which technique to apply, parses response, returns
+- Honors `signal` because LLM calls do
+- ✓ Fits (though we won't ship it)
+
+All three fit without interface changes. The interface is correct.
+
+#### 17.3.2 What the interface deliberately does NOT include
+
+- **No `train` or `update` method.** Online learning is out of scope. The semantic router will be retrained externally and republished as a new model version.
+- **No batching API.** A single decide-per-request is sufficient. Batching across concurrent requests is an implementation optimization, not an interface concern.
+- **No "fallback router" mechanism.** Composition is the user's tool (`composeRouters`); the router itself decides or returns empty.
+- **No telemetry hooks.** Logs go through the existing `Logger`. Adding a separate metrics interface is v0.3+ if needed.
+
+### 17.4 The `Rule` type
+
+```typescript
+export interface Rule {
+  readonly name: string;
+
+  /**
+   * Pure predicate. MUST be deterministic and side-effect-free.
+   * MUST be synchronous (rules don't do I/O).
+   */
+  when(input: RuleInput): boolean;
+
+  /**
+   * Produces a partial decision when `when` returns true.
+   * The router merges partial decisions from all matching rules.
+   */
+  apply(input: RuleInput): PartialDecision;
+}
+
+export interface RuleInput {
+  readonly request: ChatRequest;
+  readonly modelProfile: ModelProfile;
+  readonly effortBudget?: number;
+  /**
+   * Verifier registry, available if a rule wants to pair a verifier with a
+   * technique (e.g., planSearch + unitTestVerifier). Rules MUST handle the
+   * case where the requested verifier isn't registered (return undefined,
+   * let the technique use its default behavior).
+   */
+  readonly verifiers: VerifierRegistry;
+}
+
+export interface PartialDecision {
+  readonly techniques: Technique[];
+}
+
+/**
+ * Identity function. Exists only for IDE type narrowing when defining rules.
+ */
+export function rule(spec: Rule): Rule { return spec; }
+```
+
+#### 17.4.1 Deliberate non-features
+
+These are tempting to add and have been explicitly rejected. Reviewers should treat any pull request adding these as a design discussion, not a routine change.
+
+| Non-feature | Why excluded |
+|---|---|
+| Rule priorities | Composition is the merge mechanism. Two rules that fire produce two contributions. If they conflict semantically, that's a rule-set bug; encoding priority in core hides the conflict instead of surfacing it. |
+| Rule deactivation by other rules | Same as above. The SC fallback rule's predicate is `() => true`; it composes additively, which is correct. If a user wants "default only if no other rule fired," they write that predicate themselves. |
+| Async predicates | Rules don't do I/O. If a routing decision needs async work, it's a Router-implementation concern, not a Rule concern. Forcing sync predicates keeps rule evaluation sub-millisecond. |
+| Rule grouping / namespaces | Premature. The default set has four rules. If a user has 40, that's a different problem to solve. |
+| Rule weights / scoring | Not relevant for hard decisions (a technique is either applied or not). Confidence belongs on the Router's output, not on individual rules. |
+
+### 17.5 Default rule set
+
+The four rules below ship as `defaultRules` in `src/router.ts`. Users construct their own router with these (`rulesRouter(defaultRules)`), replace some (`rulesRouter([...defaultRules.filter(...), customRule])`), or write their own from scratch.
+
+```typescript
+export const defaultRules: Rule[] = [
+  // (1) Memory: input larger than 70% of the model's effective context window.
+  // The technique itself no-ops if the document fits, so this rule is safe to
+  // fire whenever the threshold is exceeded.
+  rule({
+    name: 'memory-for-long-input',
+    when: ({ request, modelProfile }) =>
+      estimateTokens(request) > 0.7 * (modelProfile.contextWindow ?? 32_000),
+    apply: () => ({ techniques: [memory({})] }),
+  }),
+
+  // (2) PlanSearch for code generation.
+  // Gated by effortBudget because PlanSearch is expensive (5-7× tokens).
+  // If a unit-test verifier is registered, pair it in; otherwise PlanSearch
+  // falls back to voting on extracted answers.
+  rule({
+    name: 'plan-search-for-code',
+    when: ({ request, effortBudget = 0.5 }) =>
+      looksLikeCodeGeneration(request) && effortBudget >= 0.4,
+    apply: ({ verifiers }) => ({
+      techniques: [planSearch({
+        numPlans: 5,
+        verifier: verifiers.get('unit-test'),
+      })],
+    }),
+  }),
+
+  // (3) RoundTrip for translation and summarization.
+  // Always fires when detected; RoundTrip is medium-cost (2× tokens) and works
+  // even at lower effortBudget levels.
+  rule({
+    name: 'round-trip-for-translation-or-summary',
+    when: ({ request }) =>
+      looksLikeTranslation(request) || looksLikeSummary(request),
+    apply: () => ({ techniques: [roundTrip({})] }),
+  }),
+
+  // (4) Self-Consistency universal fallback.
+  // Always fires above the minimum effort threshold. Composes additively with
+  // any of the above: long-doc math gets [memory, self-consistency], code gets
+  // [planSearch, self-consistency], etc. The k value adapts to model and budget.
+  rule({
+    name: 'self-consistency-default',
+    when: ({ effortBudget = 0.5 }) => effortBudget >= 0.3,
+    apply: ({ modelProfile, effortBudget = 0.5 }) => ({
+      techniques: [selfConsistency({
+        k: effortBudget < 0.5
+          ? 2
+          : modelProfile.thinkingMode
+            ? 3
+            : 5,
+      })],
+    }),
+  }),
+];
+```
+
+#### 17.5.1 Composition examples
+
+| Prompt shape | Rules that fire | Resulting techniques |
+|---|---|---|
+| Short math question on thinking-mode model | (4) | `[selfConsistency({k:3})]` |
+| Short math question on non-thinking model | (4) | `[selfConsistency({k:5})]` |
+| Long document Q&A | (1), (4) | `[memory({}), selfConsistency({k:3})]` |
+| Code generation prompt | (2), (4) | `[planSearch({numPlans:5,verifier:unitTest}), selfConsistency({k:3})]` |
+| Long-document code generation | (1), (2), (4) | `[memory({}), planSearch({...}), selfConsistency({k:3})]` |
+| Translation request | (3), (4) | `[roundTrip({}), selfConsistency({k:3})]` |
+| Any prompt with `effortBudget=0.2` | (none past threshold) | `[]` — empty, falls through to server defaults |
+| Code generation with `effortBudget=0.3` | (4) only — code rule needs ≥0.4 | `[selfConsistency({k:2})]` |
+
+The composition is the value. No single rule expresses "long-document code generation should use Memory + PlanSearch + SC"; that emerges from three independent rules firing.
+
+#### 17.5.2 Customizing the rule set
+
+Users replace or extend the default set by passing their own array:
+
+```typescript
+// Drop the PlanSearch rule (e.g., for a deployment with no code workloads):
+createGateway({
+  router: rulesRouter(defaultRules.filter(r => r.name !== 'plan-search-for-code')),
+});
+
+// Add a domain-specific rule (e.g., always wrap medical queries in BoN with
+// a domain-specific judge verifier):
+createGateway({
+  router: rulesRouter([
+    ...defaultRules,
+    rule({
+      name: 'medical-domain-best-of-n',
+      when: ({ request }) => looksLikeMedicalQuery(request),
+      apply: ({ verifiers }) => ({
+        techniques: [bestOfN({
+          n: 5,
+          verifier: verifiers.get('medical-judge'),
+        })],
+      }),
+    }),
+  ]),
+});
+```
+
+This is the entire customization API. Power-users can do whatever they want; the simple cases stay simple.
+
+### 17.6 The `rulesRouter` implementation
+
+```typescript
+export function rulesRouter(rules: Rule[]): Router {
+  return {
+    name: 'rules',
+    async decide(request, context) {
+      const input: RuleInput = {
+        request,
+        modelProfile: context.modelProfile,
+        effortBudget: context.effortBudget,
+        verifiers: getVerifierRegistry(), // passed in via gateway construction
+      };
+      const matched: string[] = [];
+      const techniques: Technique[] = [];
+      for (const r of rules) {
+        if (context.signal.aborted) throw new AbortError();
+        if (r.when(input)) {
+          matched.push(r.name);
+          techniques.push(...r.apply(input).techniques);
+        }
+      }
+      return {
+        techniques,
+        reason: matched.length === 0
+          ? 'no rules matched'
+          : `matched rules: ${matched.join(', ')}`,
+        // No confidence — rules are deterministic
+      };
+    },
+  };
+}
+```
+
+That's the whole implementation. About 25 lines plus the rule definitions. The simplicity is the point.
+
+### 17.7 The `composeRouters` combinator
+
+For users who want hybrid routing — typically rules-as-override on top of a semantic router in v0.3:
+
+```typescript
+export function composeRouters(routers: Router[]): Router {
+  return {
+    name: `composed(${routers.map(r => r.name).join('+')})`,
+    async init() {
+      for (const r of routers) await r.init?.();
+    },
+    async close() {
+      for (const r of routers) await r.close?.();
+    },
+    async decide(request, context) {
+      const decisions = await Promise.all(
+        routers.map(r => r.decide(request, context))
+      );
+      return {
+        techniques: decisions.flatMap(d => d.techniques),
+        reason: decisions.map((d, i) => `[${routers[i].name}] ${d.reason}`).join('; '),
+        confidence: decisions
+          .map(d => d.confidence)
+          .filter((c): c is number => typeof c === 'number')
+          .reduce<number | undefined>((min, c) => min === undefined ? c : Math.min(min, c), undefined),
+      };
+    },
+  };
+}
+```
+
+Composition order matters for technique ordering: `composeRouters([a, b])` produces techniques in order `[...a's techniques, ...b's techniques]`, which determines outer-to-inner composition in the pipeline.
+
+The v0.3 hybrid pattern is then trivial:
+
+```typescript
+import { rulesRouter, composeRouters, rule, memory } from '@xinity/prism';
+import { semanticRouter } from '@xinity/prism-router-semantic';
+
+createGateway({
+  router: composeRouters([
+    semanticRouter({ model: 'modernbert-large' }),
+    // Override: always include memory for long inputs, regardless of classifier
+    rulesRouter([
+      rule({
+        name: 'memory-override',
+        when: ({ request, modelProfile }) =>
+          estimateTokens(request) > 0.7 * (modelProfile.contextWindow ?? 32_000),
+        apply: () => ({ techniques: [memory({})] }),
+      }),
+    ]),
+  ]),
+});
+```
+
+Shipping `composeRouters` in v0.2 (before the semantic router exists) is intentional — it means v0.3 is a pure addition, no core changes needed.
+
+### 17.8 Auto-plugin-activation
+
+The other half of v0.2. Each `Transform` gets an optional self-activation predicate; the pipeline calls it when enabled.
+
+#### 17.8.1 Transform interface change
+
+```typescript
+export interface Transform {
+  readonly name: string;
+  pre?(request: ChatRequest, state: TransformState): Promise<ChatRequest>;
+  post?(response: ChatResponse, state: TransformState): Promise<ChatResponse>;
+  postChunk?(chunk: ChatChunk, state: TransformState): Promise<ChatChunk>;
+
+  /**
+   * NEW in v0.2. Optional predicate for auto-activation.
+   *
+   * When the gateway is configured with `autoActivatePlugins: true`, the pipeline
+   * calls this on every request and includes the plugin in the chain only if it
+   * returns true.
+   *
+   * If absent, the plugin is always included when registered (v0.1 behavior).
+   */
+  shouldActivate?(request: ChatRequest, modelProfile: ModelProfile): boolean;
+}
+```
+
+#### 17.8.2 Default `shouldActivate` for the three core plugins
+
+```typescript
+// In src/plugins/privacy.ts
+export function privacy(opts?: PrivacyOptions): Transform {
+  return {
+    name: 'privacy',
+    shouldActivate: (request) => containsPii(request.messages),
+    pre: async (req, state) => { /* existing redaction logic */ },
+    post: async (resp, state) => { /* existing restoration logic */ },
+    postChunk: async (chunk, state) => { /* existing chunk restoration */ },
+  };
+}
+
+// In src/plugins/read-urls.ts
+export function readUrls(opts?: ReadUrlsOptions): Transform {
+  return {
+    name: 'read-urls',
+    shouldActivate: (request) => hasUrlsInMessages(request.messages),
+    pre: async (req, state) => { /* existing fetch-and-inject logic */ },
+  };
+}
+
+// In src/plugins/json.ts
+export function json(opts: { schema?: ZodSchema; ... }): Transform {
+  return {
+    name: 'json',
+    shouldActivate: (request) => Boolean(
+      request.responseFormat?.type === 'json_schema' ||
+      request.responseFormat?.type === 'json_object' ||
+      opts.schema, // explicit schema passed at construction
+    ),
+    pre: async (req, state) => { /* unchanged */ },
+    post: async (resp, state) => { /* unchanged */ },
+  };
+}
+```
+
+#### 17.8.3 Why this is not a router
+
+A central "plugin router" would have to know about all plugins, their trigger conditions, and how to compose them. Putting the predicate on each plugin keeps:
+
+- **Authorship local.** A new plugin ships with its own activation logic, no central registry to update.
+- **Testing local.** A plugin's tests cover its own predicate; no integration test needed for activation.
+- **Composition trivial.** All registered plugins are checked; the ones that activate are included in order. No conflict resolution needed.
+- **Backwards compatible.** A v0.1 plugin with no `shouldActivate` field is always included (existing behavior).
+
+The router and auto-activation share zero code paths. They are conceptually adjacent but operationally independent.
+
+### 17.9 Pipeline integration and merge semantics
+
+The four-case decision table for technique selection per request:
+
+| Request `xinity.techniques` | Gateway `router` configured | Behavior | Log event |
+|---|---|---|---|
+| Explicit (non-empty) | Yes | Router bypassed; explicit techniques used. | `router.bypassed` |
+| Explicit (non-empty) | No | Explicit techniques used. | (none — normal path) |
+| Absent or empty | Yes | Router decides. | `router.decision` |
+| Absent or empty | No | Server `defaults.techniques` used. | `router.fallback` |
+
+For plugins, the rule is independent:
+
+| Plugin source | `autoActivatePlugins` flag | Behavior |
+|---|---|---|
+| Explicit in request `xinity.plugins` | (ignored) | All explicit plugins included. |
+| Server `defaults.plugins` | `false` | All defaults included (v0.1 behavior). |
+| Server `defaults.plugins` | `true` | Each default plugin's `shouldActivate(request)` checked; included only if true. |
+
+When `autoActivatePlugins: true` and a request comes in with explicit `xinity.plugins`, the explicit plugins are still always included (developer-explicit beats automation), but server-default plugins are gated by `shouldActivate`.
+
+#### 17.9.1 Logging events
+
+Every routing decision and every plugin activation decision emits a structured log event. This is the audit trail required by Xinity's positioning ("every per-request decision is in your structured logs").
+
+```jsonc
+// Router was bypassed because user supplied explicit techniques
+{ "event": "router.bypassed", "reason": "explicit xinity.techniques in request", "techniques": ["self-consistency"] }
+
+// Router fired and selected techniques
+{ "event": "router.decision",
+  "router": "rules",
+  "techniques": ["memory", "self-consistency"],
+  "reason": "matched rules: memory-for-long-input, self-consistency-default",
+  "confidence": null,
+  "duration_ms": 0.3 }
+
+// No router configured; using server defaults
+{ "event": "router.fallback", "techniques": ["self-consistency"], "source": "server.defaults" }
+
+// Plugin auto-activation decisions (one per registered default plugin when flag is on)
+{ "event": "plugin.auto-activated", "plugin": "privacy", "reason": "containsPii returned true" }
+{ "event": "plugin.auto-skipped", "plugin": "read-urls", "reason": "no URLs detected" }
+
+// Router lifecycle
+{ "event": "router.init", "router": "rules", "duration_ms": 0.1 }
+{ "event": "router.close", "router": "rules" }
+```
+
+#### 17.9.2 Updated pipeline composition
+
+The v0.1 pipeline (DESIGN.md §11) is extended:
+
+```typescript
+export async function buildPipeline(
+  request: ChatRequest,
+  config: ResolvedConfig,
+): Promise<RequestHandler> {
+  // 1. Resolve techniques (the four-case table above)
+  const techniques = await resolveTechniques(request, config);
+
+  // 2. Resolve plugins (the auto-activation table above)
+  const transforms = await resolveTransforms(request, config);
+
+  // 3. Build composed handler — unchanged from v0.1
+  return composeHandler(techniques, transforms, config.upstream, config.modelProfile);
+}
+
+async function resolveTechniques(
+  request: ChatRequest,
+  config: ResolvedConfig,
+): Promise<Technique[]> {
+  if (request.xinity?.techniques?.length) {
+    config.logger.info({ event: 'router.bypassed', reason: 'explicit xinity.techniques in request' });
+    return resolveTechniqueRefs(request.xinity.techniques, config);
+  }
+  if (config.router) {
+    const start = performance.now();
+    const decision = await config.router.decide(request, {
+      modelProfile: config.modelProfile,
+      effortBudget: request.xinity?.effortBudget ?? config.defaults?.effortBudget,
+      signal: config.signal,
+      logger: config.logger,
+    });
+    config.logger.info({
+      event: 'router.decision',
+      router: config.router.name,
+      techniques: decision.techniques.map(t => t.name),
+      reason: decision.reason,
+      confidence: decision.confidence ?? null,
+      duration_ms: performance.now() - start,
+    });
+    return decision.techniques;
+  }
+  config.logger.info({ event: 'router.fallback', source: 'server.defaults' });
+  return config.defaults?.techniques ?? [];
+}
+```
+
+### 17.10 Rejected alternative: unified routing
+
+The most common architectural mistake during this design was unifying plugin activation and technique routing into a single mechanism. The unified version would look like:
+
+```typescript
+// REJECTED
+interface UnifiedRouter {
+  decide(request): { techniques: Technique[]; plugins: Transform[] };
+}
+```
+
+This was rejected for three reasons:
+
+1. **Different decision shape.** Plugin activation is a yes/no per plugin based on a local predicate. Technique selection is a multi-select over a catalog based on judgment. Forcing them through one interface either bloats it or loses information.
+2. **Different update cadence.** Plugin triggers change when plugins are added or modified (rare, structural). Technique routing changes when models, benchmarks, or customer workloads shift (frequent, semantic). Coupling them means a model retraining for the technique router triggers plugin churn.
+3. **Different testability.** Plugin predicates are tested with the plugin (`privacy.test.ts` covers `containsPii`). Routing decisions are tested as a system (does the rule set produce the right techniques for a realistic prompt corpus). Unifying them blends these test surfaces.
+
+The asymmetry — plugins self-activate, techniques are routed — is the design. Future contributors who propose unification should re-read this section.
+
+### 17.11 v0.3 extension: `@xinity/prism-router-semantic`
+
+Out of scope for this section; documented here only to validate the interface design.
+
+The semantic router will be a separate npm package: `@xinity/prism-router-semantic`. It will declare `@xinity/prism` as a peer dependency (so it uses the consumer's version rather than bundling its own) and add `onnxruntime-node` and a tokenizer dependency.
+
+Expected structure:
+
+```typescript
+// In @xinity/prism-router-semantic
+import { Router, RouterContext, RouterDecision, Technique } from '@xinity/prism';
+
+export interface SemanticRouterOptions {
+  readonly model: 'modernbert-large' | string;
+  readonly device?: 'cpu' | 'cuda' | 'metal';
+  readonly confidenceThreshold?: number; // default 0.5
+  readonly techniqueRegistry?: Record<string, () => Technique>;
+}
+
+export function semanticRouter(opts: SemanticRouterOptions): Router {
+  let session: InferenceSession | undefined;
+  let tokenizer: Tokenizer | undefined;
+  return {
+    name: 'semantic',
+    async init() {
+      session = await loadOnnxSession(opts.model, opts.device);
+      tokenizer = await loadTokenizer(opts.model);
+    },
+    async close() { await session?.release(); },
+    async decide(request, context) {
+      if (!session || !tokenizer) throw new Error('semanticRouter not initialized');
+      const text = extractPromptText(request);
+      const tokens = tokenizer.encode(text);
+      const logits = await session.run({ input_ids: tokens, effort: [context.effortBudget ?? 0.5] }, context.signal);
+      const { techniques, confidence } = decodeLogits(logits, opts.techniqueRegistry);
+      return {
+        techniques,
+        reason: `classifier predicted [${techniques.map(t => t.name).join(', ')}] with confidence ${confidence.toFixed(2)}`,
+        confidence,
+      };
+    },
+  };
+}
+```
+
+Validation: this implementation fits the `Router` interface exactly as specified in 17.3. No interface changes needed between v0.2 and v0.3.
+
+The hybrid pattern (semantic primary + rules override) is enabled by `composeRouters`, also shipped in v0.2. The v0.3 release adds the package; no core changes.
+
+#### 17.11.1 What v0.3 will NOT change
+
+To set expectations and constrain v0.3 scope:
+
+- The `Router`, `RouterContext`, `RouterDecision`, `Rule`, `RuleInput`, `PartialDecision` types in core do not change.
+- The `composeRouters` combinator does not change.
+- The default rule set does not change (semantic router is an alternative, not a replacement).
+- Pipeline merge semantics do not change.
+
+The only v0.3 core changes anticipated:
+
+- README mention of the semantic router as an available companion package (currently "coming in v0.3").
+- Possibly a `routerConfidenceThreshold` config field on `createGateway` for the optional fallback-on-low-confidence behavior described in 17.3.
+
+### 17.12 Configuration API additions
+
+`createGateway` accepts two new optional fields in v0.2:
+
+```typescript
+interface GatewayConfig {
+  // ... existing v0.1 fields unchanged ...
+
+  /**
+   * Optional Router for automatic technique selection.
+   * When set, requests without explicit xinity.techniques are routed through this.
+   */
+  router?: Router;
+
+  /**
+   * When true, registered plugins are included in each request's pipeline only
+   * if their shouldActivate predicate returns true (or if they have no predicate).
+   *
+   * When false (default, v0.1 behavior), all registered plugins are always
+   * included.
+   *
+   * Does NOT affect plugins passed explicitly in xinity.plugins — those are
+   * always included.
+   */
+  autoActivatePlugins?: boolean;
+}
+```
+
+`defaults.effortBudget` is also added as an optional default for the per-request `xinity.effortBudget` field:
+
+```typescript
+interface DefaultsConfig {
+  // ... existing v0.1 fields ...
+  effortBudget?: number;
+}
+```
+
+### 17.13 Testing strategy
+
+#### 17.13.1 Detection helpers
+- 10 positive + 10 negative example prompts each, drawn from realistic conversations (not synthetic).
+- Multilingual coverage: at least one positive example per supported language (EN, DE, FR, IT, ES).
+- Tests live in `tests/unit/detection.test.ts`.
+
+#### 17.13.2 Default rules
+- Each rule has at least 3 positive (predicate true) and 3 negative (predicate false) test cases.
+- Tests verify both the predicate AND the resulting partial decision.
+- Tests live in `tests/unit/rules.test.ts`.
+
+#### 17.13.3 Router conformance contract
+- A reusable test function that takes a `Router` instance and asserts contract compliance:
+  - `decide` honors `signal` (aborts mid-decide propagate)
+  - `decide` is deterministic for same input (rule-based) OR returns confidence (semantic, future)
+  - `init` is idempotent if called twice (with a warning)
+  - `close` releases resources
+  - `decide` does not mutate request or context
+- This contract test is exported from `@xinity/prism` so `@xinity/prism-router-semantic` can reuse it in v0.3.
+- Tests live in `tests/unit/router-contract.test.ts`.
+
+#### 17.13.4 Pipeline merge semantics
+- All four cases of the technique decision table, with explicit fixtures.
+- All cases of the plugin auto-activation table.
+- Verification that log events fire correctly per case.
+- Tests live in `tests/unit/pipeline-routing.test.ts`.
+
+#### 17.13.5 Composition
+- `composeRouters([])` returns empty decision.
+- `composeRouters([single])` behaves identically to `single`.
+- `composeRouters([a, b])` concatenates techniques in correct order.
+- `composeRouters` propagates `init` and `close` to all children.
+- `composeRouters` returns minimum confidence when any child returns one.
+- Tests live in `tests/unit/compose-routers.test.ts`.
+
+#### 17.13.6 Backwards compatibility
+- A v0.1-style `createGateway({ upstream, defaults })` with no `router` and no `autoActivatePlugins` produces byte-identical behavior to v0.1.
+- Tested by replaying a fixture of v0.1 requests/responses through v0.2 and asserting equality.
+- Tests live in `tests/integration/v01-compat.test.ts`.
+
+### 17.14 Worked end-to-end example
+
+A request hits the v0.2 gateway with the router and auto-activation both active.
+
+**Setup:**
+```typescript
+createGateway({
+  upstream: { baseUrl: 'http://localhost:11434/v1' },
+  router: rulesRouter(defaultRules),
+  autoActivatePlugins: true,
+  defaults: {
+    plugins: [privacy(), readUrls(), json()],
+    effortBudget: 0.7,
+  },
+  modelProfiles: [
+    { match: /qwen3.*thinking/i, thinkingMode: true, supportsLogprobs: true, contextWindow: 32000 },
+  ],
+});
+```
+
+**Request:**
+```http
+POST /v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "qwen3-32b-thinking",
+  "messages": [{
+    "role": "user",
+    "content": "Please summarize the document at https://example.com/q3-report.pdf and email the key findings to alex@example.com."
+  }],
+  "stream": false
+}
+```
+
+**Flow:**
+
+1. Server validates request, normalizes to `ChatRequest`, resolves `modelProfile` = thinking-mode Qwen3.
+2. `resolveTechniques` is called. Request has no `xinity.techniques`, so the router runs.
+3. `rulesRouter.decide` evaluates each rule in order:
+   - `memory-for-long-input`: estimated tokens ~30 (way under threshold). FALSE.
+   - `plan-search-for-code`: `looksLikeCodeGeneration` returns false (no code fences, no coding verbs, no language names). FALSE.
+   - `round-trip-for-translation-or-summary`: `looksLikeSummary` returns true ("summarize" + content). TRUE.
+   - `self-consistency-default`: effortBudget 0.7 ≥ 0.3. TRUE.
+4. Router returns `{ techniques: [roundTrip({}), selfConsistency({k:3})], reason: "matched rules: round-trip-for-translation-or-summary, self-consistency-default" }`.
+5. Log emitted: `{ event: "router.decision", router: "rules", techniques: ["round-trip", "self-consistency"], ... }`.
+6. `resolveTransforms` is called. `autoActivatePlugins: true`, so each default plugin's `shouldActivate` is checked:
+   - `privacy.shouldActivate(req)`: `containsPii` finds `alex@example.com`. TRUE. Included.
+   - `readUrls.shouldActivate(req)`: `hasUrlsInMessages` finds `https://example.com/q3-report.pdf`. TRUE. Included.
+   - `json.shouldActivate(req)`: no `response_format`, no explicit schema. FALSE. Excluded.
+7. Logs: `plugin.auto-activated` for privacy and read-urls; `plugin.auto-skipped` for json.
+8. Pipeline composes: `[privacy.pre, readUrls.pre] → roundTrip(selfConsistency(upstream)) → [readUrls.post, privacy.post]`.
+9. Execution: privacy redacts the email to `[XINITY_PII_EMAIL_001]`. readUrls fetches the PDF, extracts text, prepends as system context. SC runs 3 samples in parallel through RoundTrip. RoundTrip's forward pass produces a summary; reverse pass attempts to reconstruct the question; equivalence score 0.87 (above 0.8 threshold). The three SC candidates are voted on. Winner is restored: PII restored from placeholder back to original email.
+10. Response sent.
+
+Total log events emitted: ~12, all structured JSON. The full routing and activation decision trail is in stderr.
+
+### 17.15 Open questions and v0.2.x followups
+
+1. **Per-route routing overrides.** v0.2 ships gateway-level router config. A future minor release may add per-route (per-endpoint?) overrides. Not in v0.2 because the right abstraction isn't clear yet.
+
+2. **Routing-decision cache.** For high-traffic deployments, identical prompts get routed identically. A small LRU cache on `decide()` could save 50-100ms on the semantic router (irrelevant for rules). Not in v0.2; revisit when semantic ships.
+
+3. **The `effortBudget` semantics on the semantic router.** v0.2 defines it for rule-based use (predicates check it). v0.3 will pass it as a feature into the classifier. The interface declares it; both implementations honor it; concrete behavior differs. Document clearly in v0.3.
+
+4. **Should `defaultRules` be the export, or `createDefaultRules(opts)`?** Currently a static array. A factory would allow opts like "use SC k=10 default instead of k=5", but adds API surface. Tabled for now; reconsider if users ask.
+
+End of section 17.
+
 End of design.
