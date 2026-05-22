@@ -1,7 +1,9 @@
-import { resolveConfig, type Registry } from './config.ts';
+import { resolveConfigStaged, type Registry, type StagedConfig } from './config.ts';
 import { createJsonLogger } from './logging.ts';
 import { resolveModelProfile } from './model-profile.ts';
 import { pipelineRun } from './pipeline.ts';
+import { rulesRouter } from './router/rules.ts';
+import type { Router } from './router/types.ts';
 import { encodeProgressEvent, responseToSingleChunk } from './streaming.ts';
 import { createHttpUpstreamClient, type HttpUpstreamConfig } from './upstream.ts';
 import {
@@ -28,6 +30,16 @@ export type GatewayConfig = {
   modelProfiles?: ModelProfile[];
   registry?: Partial<Registry>;
   logger?: Logger;
+  /**
+   * Optional auto-routing strategy. `'rules'` activates the in-tree
+   * {@link rulesRouter} with default settings. `'none'` (or omitted) means no
+   * router — v0.1 behavior. A custom {@link Router} can be passed for the
+   * future `@xinity/prism-router-semantic` integration.
+   *
+   * The router is consulted per-request, only when `xinity.auto === 'plugins'`
+   * (or `X-Xinity-Auto: plugins` header) is set.
+   */
+  router?: Router | 'rules' | 'none';
 };
 
 export type Gateway = {
@@ -45,6 +57,7 @@ export function createGateway(config: GatewayConfig): Gateway {
     techniques: new Map(config.registry?.techniques),
     transforms: new Map(config.registry?.transforms),
   };
+  const router = normalizeRouter(config.router);
 
   async function handle(req: Request): Promise<Response> {
     const url = new URL(req.url);
@@ -74,9 +87,9 @@ export function createGateway(config: GatewayConfig): Gateway {
     }
     const wireReq = parsed.data;
 
-    let resolved;
+    let staged: StagedConfig;
     try {
-      resolved = resolveConfig({
+      staged = resolveConfigStaged({
         model: wireReq.model,
         body: wireReq.xinity,
         headers: headersToRecord(req.headers),
@@ -86,20 +99,29 @@ export function createGateway(config: GatewayConfig): Gateway {
       return errorToResponse(err);
     }
 
-    const internalReq = fromWireRequest({ ...wireReq, model: resolved.resolvedModel });
-    const modelProfile = resolveModelProfile(resolved.resolvedModel, profiles, resolved.modelProfileName);
+    const internalReq = fromWireRequest({ ...wireReq, model: staged.resolvedModel });
+    const modelProfile = resolveModelProfile(staged.resolvedModel, profiles, staged.modelProfileName);
     const wantsStream = wireReq.stream === true;
+
+    const routerWillRun = router !== undefined && staged.auto === 'plugins';
+    const v01Effective = effectiveV01Final(staged);
 
     requestLogger.info({
       event: 'request.received',
-      model: resolved.resolvedModel,
-      techniques: resolved.techniques.map(t => t.name),
-      plugins: resolved.transforms.map(t => t.name),
+      model: staged.resolvedModel,
+      techniques: v01Effective.techniques.map(t => t.name),
+      plugins: v01Effective.transforms.map(t => t.name),
       stream: wantsStream,
+      ...(staged.auto !== undefined && { auto: staged.auto }),
+      ...(routerWillRun && { routerEnabled: true }),
     });
 
-    // ---- Pass-through fast path: zero techniques + zero plugins -------------
-    if (resolved.techniques.length === 0 && resolved.transforms.length === 0) {
+    // ---- Pass-through fast path: zero techniques + zero plugins + no router -
+    if (
+      !routerWillRun &&
+      v01Effective.techniques.length === 0 &&
+      v01Effective.transforms.length === 0
+    ) {
       try {
         const raw = await upstream.raw(internalReq, controller.signal);
         return new Response(raw.body, { status: raw.status, headers: forwardHeaders(raw.headers) });
@@ -109,11 +131,19 @@ export function createGateway(config: GatewayConfig): Gateway {
     }
 
     // ---- Active pipeline ---------------------------------------------------
+    const activeRouter = routerWillRun ? router : undefined;
+    const serverDefaults = {
+      transforms: staged.defaultTransforms,
+      techniques: staged.defaultTechniques,
+    };
+
     if (wantsStream) {
       return runStreaming({
-        techniques: resolved.techniques,
-        transforms: resolved.transforms,
         request: internalReq,
+        ...(staged.explicitTechniques !== undefined && { techniques: staged.explicitTechniques }),
+        ...(staged.explicitTransforms !== undefined && { transforms: staged.explicitTransforms }),
+        ...(activeRouter !== undefined && { router: activeRouter }),
+        serverDefaults,
         upstream,
         modelProfile,
         logger: requestLogger,
@@ -124,8 +154,10 @@ export function createGateway(config: GatewayConfig): Gateway {
     try {
       const response = await pipelineRun({
         request: internalReq,
-        techniques: resolved.techniques,
-        transforms: resolved.transforms,
+        ...(staged.explicitTechniques !== undefined && { techniques: staged.explicitTechniques }),
+        ...(staged.explicitTransforms !== undefined && { transforms: staged.explicitTransforms }),
+        ...(activeRouter !== undefined && { router: activeRouter }),
+        serverDefaults,
         upstream,
         modelProfile,
         logger: requestLogger,
@@ -150,10 +182,34 @@ export function createGateway(config: GatewayConfig): Gateway {
   };
 }
 
+function normalizeRouter(spec: Router | 'rules' | 'none' | undefined): Router | undefined {
+  if (spec === undefined || spec === 'none') return undefined;
+  if (spec === 'rules') return rulesRouter();
+  return spec;
+}
+
+/**
+ * Compute the effective v0.1-style final list from a staged config.
+ *
+ * Mirrors `resolveConfig` semantics: request-level explicit (if set) replaces
+ * server defaults wholesale, then the merged disabled list is subtracted. Used
+ * for the pass-through fast-path check and the `request.received` log event.
+ */
+function effectiveV01Final(staged: StagedConfig): { techniques: Technique[]; transforms: Transform[] } {
+  const disabled = new Set(staged.disabled);
+  const transforms = (staged.explicitTransforms ?? staged.defaultTransforms)
+    .filter(t => !disabled.has(t.name));
+  const techniques = (staged.explicitTechniques ?? staged.defaultTechniques)
+    .filter(t => !disabled.has(t.name));
+  return { transforms, techniques };
+}
+
 type StreamingArgs = {
-  techniques: Technique[];
-  transforms: Transform[];
   request: ReturnType<typeof fromWireRequest>;
+  techniques?: Technique[];
+  transforms?: Transform[];
+  router?: Router;
+  serverDefaults: { techniques: Technique[]; transforms: Transform[] };
   upstream: UpstreamClient;
   modelProfile: ModelProfile;
   logger: Logger;
@@ -181,8 +237,10 @@ function runStreaming(args: StreamingArgs): Response {
       try {
         const response = await pipelineRun({
           request: args.request,
-          techniques: args.techniques,
-          transforms: args.transforms,
+          ...(args.techniques !== undefined && { techniques: args.techniques }),
+          ...(args.transforms !== undefined && { transforms: args.transforms }),
+          ...(args.router !== undefined && { router: args.router }),
+          serverDefaults: args.serverDefaults,
           upstream: args.upstream,
           modelProfile: args.modelProfile,
           logger: args.logger,
