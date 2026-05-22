@@ -64,12 +64,22 @@ const XinityTechniqueRefSchema = z.union([
   z.object({ name: z.string(), options: z.unknown().optional() }),
 ]);
 
+/**
+ * Auto-routing mode. `'plugins'` enables the rules-based router for this
+ * request (privacy/readUrls/json/memory). `'none'` disables it.
+ *
+ * Reserved for forward-compat: `'techniques'` and `'all'` will be added when
+ * the semantic router (v0.3, `@xinity/prism-router-semantic`) ships.
+ */
+const XinityAutoSchema = z.enum(['plugins', 'none']);
+
 export const XinityConfigSchema = z
   .object({
     techniques: z.array(XinityTechniqueRefSchema).optional(),
     plugins: z.array(XinityTechniqueRefSchema).optional(),
     modelProfile: z.string().optional(),
     disabled: z.array(z.string()).optional(),
+    auto: XinityAutoSchema.optional(),
   })
   .strict();
 
@@ -190,11 +200,14 @@ export type Message = {
 
 export type XinityTechniqueRef = string | { name: string; options?: unknown };
 
+export type XinityAutoMode = z.infer<typeof XinityAutoSchema>;
+
 export type XinityConfig = {
   techniques?: XinityTechniqueRef[];
   plugins?: XinityTechniqueRef[];
   modelProfile?: string;
   disabled?: string[];
+  auto?: XinityAutoMode;
 };
 
 export type ChatRequest = {

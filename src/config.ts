@@ -1,5 +1,5 @@
 import { GatewayError, XinityConfigSchema } from './types.ts';
-import type { Technique, Transform, XinityConfig, XinityTechniqueRef } from './types.ts';
+import type { Technique, Transform, XinityAutoMode, XinityConfig, XinityTechniqueRef } from './types.ts';
 
 /**
  * Per-gateway registry of technique/transform factories. The only "registry"
@@ -16,6 +16,12 @@ export type ResolvedConfig = {
   modelProfileName?: string;
   /** The base model name with any @-suffix stripped. */
   resolvedModel: string;
+  /**
+   * Per-request auto-routing mode, resolved with the same
+   * defaults < model < body < headers precedence as everything else.
+   * Undefined means "no auto-routing for this request" (the v0.1 default).
+   */
+  auto?: XinityAutoMode;
 };
 
 export type ConfigSources = {
@@ -51,6 +57,7 @@ export function resolveConfig(sources: ConfigSources, registry: Registry): Resol
     if (layer.plugins !== undefined) merged.plugins = layer.plugins;
     if (layer.modelProfile !== undefined) merged.modelProfile = layer.modelProfile;
     if (layer.disabled !== undefined) merged.disabled = layer.disabled;
+    if (layer.auto !== undefined) merged.auto = layer.auto;
   }
 
   const disabled = new Set(merged.disabled ?? []);
@@ -65,6 +72,88 @@ export function resolveConfig(sources: ConfigSources, registry: Registry): Resol
     techniques,
     transforms,
     modelProfileName: merged.modelProfile,
+    resolvedModel: fromModel.baseModel,
+    ...(merged.auto !== undefined && { auto: merged.auto }),
+  };
+}
+
+/**
+ * Layered view of the request configuration, used by the v0.2 router path.
+ *
+ * Unlike {@link ResolvedConfig} (which flattens everything into one merged
+ * pair of arrays), this keeps request-level explicit choices separate from
+ * server defaults so the merge layer in `pipelineRun` can apply the router
+ * precedence model correctly.
+ *
+ *   - `explicit*` is `undefined` when no request layer set the field. An
+ *     empty array means the request explicitly set "no plugins".
+ *   - `default*` reflects only the server defaults layer (from
+ *     `createGateway({ defaults })`), already instantiated.
+ *   - `disabled` and `auto` follow the v0.1 last-wins merge across layers.
+ */
+export type StagedConfig = {
+  explicitTransforms?: Transform[];
+  explicitTechniques?: Technique[];
+  defaultTransforms: Transform[];
+  defaultTechniques: Technique[];
+  disabled: string[];
+  auto?: XinityAutoMode;
+  modelProfileName?: string;
+  resolvedModel: string;
+};
+
+/**
+ * Resolve a request into the layered staged view. Used by the v0.2 server
+ * path when a router is configured; the v0.1 path keeps using `resolveConfig`.
+ *
+ * Same precedence layering as {@link resolveConfig}
+ * (defaults < model-suffix < body < headers); plugins/techniques don't
+ * cross layers (request layers override defaults wholesale).
+ */
+export function resolveConfigStaged(sources: ConfigSources, registry: Registry): StagedConfig {
+  const fromModel = parseModelSuffix(sources.model);
+  const fromHeaders = parseHeaders(sources.headers ?? {});
+  const defaultsLayer = sources.defaults ?? {};
+  const requestLayers: XinityConfig[] = [fromModel.config, sources.body ?? {}, fromHeaders];
+
+  // Among request layers, highest-priority (last) that sets the field wins.
+  let explicitPluginsRaw: XinityTechniqueRef[] | undefined;
+  let explicitTechniquesRaw: XinityTechniqueRef[] | undefined;
+  for (const layer of requestLayers) {
+    if (layer.plugins !== undefined) explicitPluginsRaw = layer.plugins;
+    if (layer.techniques !== undefined) explicitTechniquesRaw = layer.techniques;
+  }
+
+  // For modelProfile, auto, disabled: full last-wins layering including defaults.
+  let modelProfile: string | undefined = defaultsLayer.modelProfile;
+  let auto: XinityAutoMode | undefined = defaultsLayer.auto;
+  let disabled: string[] = defaultsLayer.disabled ?? [];
+  for (const layer of requestLayers) {
+    if (layer.modelProfile !== undefined) modelProfile = layer.modelProfile;
+    if (layer.auto !== undefined) auto = layer.auto;
+    if (layer.disabled !== undefined) disabled = layer.disabled;
+  }
+
+  const defaultTransforms = (defaultsLayer.plugins ?? [])
+    .map(ref => instantiate(ref, registry.transforms, 'plugin'));
+  const defaultTechniques = (defaultsLayer.techniques ?? [])
+    .map(ref => instantiate(ref, registry.techniques, 'technique'));
+
+  const explicitTransforms = explicitPluginsRaw !== undefined
+    ? explicitPluginsRaw.map(ref => instantiate(ref, registry.transforms, 'plugin'))
+    : undefined;
+  const explicitTechniques = explicitTechniquesRaw !== undefined
+    ? explicitTechniquesRaw.map(ref => instantiate(ref, registry.techniques, 'technique'))
+    : undefined;
+
+  return {
+    ...(explicitTransforms !== undefined && { explicitTransforms }),
+    ...(explicitTechniques !== undefined && { explicitTechniques }),
+    defaultTransforms,
+    defaultTechniques,
+    disabled,
+    ...(auto !== undefined && { auto }),
+    ...(modelProfile !== undefined && { modelProfileName: modelProfile }),
     resolvedModel: fromModel.baseModel,
   };
 }
@@ -152,7 +241,18 @@ function parseHeaders(headers: Record<string, string | undefined>): XinityConfig
   if (disabled) result.disabled = disabled.split(',').map(s => s.trim()).filter(Boolean);
   const profile = headers['x-xinity-model-profile'];
   if (profile) result.modelProfile = profile.trim();
+  const auto = headers['x-xinity-auto'];
+  if (auto) result.auto = parseAutoValue(auto.trim());
   return result;
+}
+
+function parseAutoValue(raw: string): XinityAutoMode {
+  if (raw === 'plugins' || raw === 'none') return raw;
+  throw new GatewayError(
+    400,
+    'invalid_xinity_auto',
+    `X-Xinity-Auto must be one of 'plugins' | 'none', got '${raw}'`,
+  );
 }
 
 function parseList(raw: string): XinityTechniqueRef[] {
