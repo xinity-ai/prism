@@ -156,6 +156,17 @@ X-Xinity-Plugins: privacy,read-urls
 
 For nested option payloads the mini-grammar cannot express, send a base64-encoded JSON config in `X-Xinity-Config`.
 
+## Auto-routing
+
+Opt-in, per-request. When you pass `xinity: { auto: 'plugins' }` in the body (or `X-Xinity-Auto: plugins` as a header) **and** the gateway is constructed with a router, Prism inspects the request and automatically activates the right plugins: `privacy` when PII is detected, `read-urls` when URLs are present, `json` when `response_format` is set, and the `memory` technique when input exceeds ~70% of the model's context window. Explicit `xinity.plugins` always wins — the router is ignored when you've already specified the set you want — and `xinity.disabled` strips entries from the merged result regardless of source. Default is off, so byte-for-byte transparent passthrough is preserved when no `auto` is set. The rules router only picks plugins (plus `memory`, whose trigger is structural); reasoning-technique selection is handled by the separate `@xinity/prism-router-semantic` package.
+
+```ts
+createGateway({ upstream: { baseUrl: '…' }, router: 'rules' });
+// Then in the request body:
+// { "xinity": { "auto": "plugins" }, "messages": [{ "role": "user", "content": "email alex@xinity.ai about https://example.com" }] }
+// → privacy + read-urls activate automatically; one router.decide log event is emitted.
+```
+
 ## What this is not
 
 This package is a focused proxy. It is intentionally **not**:

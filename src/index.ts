@@ -7,8 +7,8 @@ export { createHttpUpstreamClient } from './upstream.ts';
 export type { HttpUpstreamConfig } from './upstream.ts';
 
 // Config / registry
-export { resolveConfig } from './config.ts';
-export type { Registry, ResolvedConfig, ConfigSources } from './config.ts';
+export { resolveConfig, resolveConfigStaged } from './config.ts';
+export type { Registry, ResolvedConfig, StagedConfig, ConfigSources } from './config.ts';
 
 // Model profiles
 export { resolveModelProfile } from './model-profile.ts';
@@ -61,6 +61,7 @@ export type {
   Logger,
   ProgressEvent,
   XinityConfig,
+  XinityAutoMode,
   XinityTechniqueRef,
   Verifier,
   EquivalenceScorer,
@@ -104,3 +105,17 @@ export type { UnitTestVerifierOptions } from './verifiers/unit-test.ts';
 
 // Voting helpers
 export { defaultVoter, extractFinalAnswer, normalizeAnswer } from './internal/voting.ts';
+
+// Router (v0.2)
+export { rulesRouter, mergePluginSources, mergeTechniqueSources } from './router/index.ts';
+export type {
+  Router,
+  RouterContext,
+  RouterDecision,
+  RouterRationale,
+  RulesRouterOptions,
+  MergePluginSources,
+  MergeTechniqueSources,
+  TaskSignal,
+  RequestFeatures,
+} from './router/index.ts';
