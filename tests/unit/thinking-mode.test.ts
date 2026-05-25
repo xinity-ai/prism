@@ -389,3 +389,121 @@ describe('strict boolean parsing for xinity.thinking', () => {
     expect(resp.status).toBe(200);
   });
 });
+
+describe('CLI Qwen3 profile registration', () => {
+  // Mirrors the profile registered in bin/prism.ts. Kept in sync by hand —
+  // if the CLI's Qwen3 entry diverges, this test fails first.
+  const cliQwen3Profile: ModelProfile = {
+    name: 'qwen3',
+    match: /^qwen3/i,
+    thinkingMode: true,
+    thinkingModeToggleable: true,
+    supportsLogprobs: false,
+    contextWindow: 32_000,
+    thinkingParams: (on) => ({ chat_template_kwargs: { enable_thinking: on } }),
+  };
+
+  test('xinity.thinking:false against qwen3.6 translates to enable_thinking:false on the wire', async () => {
+    let capturedBody: Record<string, unknown> | null = null;
+    const upstream = createMockUpstream({
+      raw: async (req) => {
+        capturedBody = toWireRequest(req) as Record<string, unknown>;
+        return new Response('{"id":"x","choices":[]}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+    const gw = createGateway({
+      upstream,
+      logger: silentLogger,
+      modelProfiles: [cliQwen3Profile],
+    });
+
+    const resp = await gw.fetch(new Request('http://x/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'qwen3.6-35b-a3b-fp8',
+        messages: [{ role: 'user', content: 'hi' }],
+        xinity: { thinking: false },
+      }),
+    }));
+
+    expect(resp.status).toBe(200);
+    expect(capturedBody).not.toBeNull();
+    expect(capturedBody!.chat_template_kwargs).toEqual({ enable_thinking: false });
+  });
+
+  test('xinity.thinking:true against qwen3.6 translates to enable_thinking:true', async () => {
+    let capturedBody: Record<string, unknown> | null = null;
+    const upstream = createMockUpstream({
+      raw: async (req) => {
+        capturedBody = toWireRequest(req) as Record<string, unknown>;
+        return new Response('{"id":"x","choices":[]}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+    const gw = createGateway({
+      upstream,
+      logger: silentLogger,
+      modelProfiles: [cliQwen3Profile],
+    });
+
+    await gw.fetch(new Request('http://x/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'qwen3.6-35b-a3b-fp8',
+        messages: [{ role: 'user', content: 'hi' }],
+        xinity: { thinking: true },
+      }),
+    }));
+
+    expect(capturedBody!.chat_template_kwargs).toEqual({ enable_thinking: true });
+  });
+
+  test('profile match catches family variants (32b-thinking, 72b plain)', () => {
+    expect(cliQwen3Profile.match instanceof RegExp).toBe(true);
+    const re = cliQwen3Profile.match as RegExp;
+    for (const name of ['qwen3.6-35b-a3b-fp8', 'qwen3-32b-thinking', 'qwen3-72b', 'QWEN3-Large']) {
+      expect(re.test(name)).toBe(true);
+    }
+    // Anchored — must not match models that merely contain "qwen3" mid-string,
+    // and must not absorb deepseek-r1 (which has its own profile entry).
+    expect(re.test('not-qwen3-foo')).toBe(false);
+    expect(re.test('deepseek-r1')).toBe(false);
+  });
+
+  test('with the Qwen3 profile registered, no xinity.thinking request is rejected', async () => {
+    // Regression guard: the failure mode that drove this change was
+    // thinking_not_supported being returned for valid Qwen3 requests. If the
+    // CLI profile ever loses thinkingParams again, this test fails loudly.
+    const upstream = createMockUpstream({
+      raw: async () => new Response('{}', {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    });
+    const gw = createGateway({
+      upstream,
+      logger: silentLogger,
+      modelProfiles: [cliQwen3Profile],
+    });
+
+    for (const flag of [true, false]) {
+      const resp = await gw.fetch(new Request('http://x/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'qwen3.6-35b-a3b-fp8',
+          messages: [{ role: 'user', content: 'hi' }],
+          xinity: { thinking: flag },
+        }),
+      }));
+      expect(resp.status).toBe(200);
+    }
+  });
+});

@@ -119,7 +119,23 @@ const gateway = createGateway({
     ...(parsed.apiKey !== undefined && { apiKey: parsed.apiKey }),
   },
   modelProfiles: [
-    { match: /qwen3|deepseek-r1|thinking/i, thinkingMode: true, supportsLogprobs: false, contextWindow: 32_000 },
+    // Qwen3 family: thinking on by default, toggleable via the standard vLLM /
+    // SGLang chat-template kwarg. First-match wins, so this sits before the
+    // broader reasoning-model entry.
+    {
+      name: 'qwen3',
+      match: /^qwen3/i,
+      thinkingMode: true,
+      thinkingModeToggleable: true,
+      supportsLogprobs: false,
+      contextWindow: 32_000,
+      thinkingParams: (on) => ({ chat_template_kwargs: { enable_thinking: on } }),
+    },
+    // Other reasoning-tuned models whose toggle mechanism isn't standardized
+    // (DeepSeek-R1, generic *-thinking variants). thinkingMode reflects their
+    // default behavior; lack of thinkingParams means xinity.thinking is loud-
+    // rejected here on purpose until the mechanism is verified per-deployment.
+    { match: /deepseek-r1|thinking/i, thinkingMode: true, supportsLogprobs: false, contextWindow: 32_000 },
     { match: /.*/, thinkingMode: false, supportsLogprobs: false },
   ],
   registry: {
