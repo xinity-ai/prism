@@ -167,6 +167,56 @@ createGateway({ upstream: { baseUrl: '…' }, router: 'rules' });
 // → privacy + read-urls activate automatically; one router.decide log event is emitted.
 ```
 
+## Thinking mode
+
+Different inference servers expose "reasoning / thinking" through different wire conventions: Qwen3 on vLLM/SGLang wants `chat_template_kwargs: { enable_thinking: true }`, gpt-5-style endpoints want `reasoning_effort`, Anthropic-compatible proxies want a `thinking` block. Prism offers two ways to drive that, depending on how much you want to abstract over the provider.
+
+**1. First-class — let the gateway translate.** Set `xinity.thinking: true` in the body (or send `X-Xinity-Thinking: true`). The resolved [`ModelProfile.thinkingParams`](DESIGN.md#56-modelprofile) hook converts that boolean into the provider-specific wire bag and merges it into the upstream request. The same payload also flips the pipeline's thinking-mode gate for that request — techniques marked `subsumedByThinkingMode` are skipped and `selfConsistency` drops its default `k` from 5 to 3.
+
+```ts
+createGateway({
+  upstream: { baseUrl: 'http://vllm:8000/v1' },
+  modelProfiles: [{
+    name: 'qwen3',
+    match: /^qwen3/,
+    thinkingMode: false,           // default off; per-request flag flips it
+    supportsLogprobs: true,
+    thinkingParams: (on) => ({ chat_template_kwargs: { enable_thinking: on } }),
+  }],
+});
+```
+
+**Capability enforcement is loud.** A request that sets `xinity.thinking` against a profile that cannot honor it — either because `thinkingParams` is undefined, or because the profile sets `thinkingModeToggleable: false` — is rejected with a 400 `thinking_not_supported` error naming the profile. The gateway never silently no-ops on an unhandled thinking toggle. This matters for ablation studies and thinking-vs-non-thinking benchmarks: a silent fallback would flip the pipeline's gate (skipping subsumed techniques, lowering K) while the upstream still produces thinking-on completions, corrupting both arms of the comparison. Surface mismatches at request time, fix the profile, retry.
+
+Both `xinity.thinking` (body) and `X-Xinity-Thinking` (header) accept booleans strictly — `true` / `false` only. The header is case-sensitive and rejects `1`, `0`, `yes`, `True`, etc. with a 400 rather than coercing.
+
+```python
+client.chat.completions.create(
+    model="qwen3-30b",
+    messages=[...],
+    extra_body={"xinity": {"thinking": True}},
+)
+# Gateway sends to upstream:
+# { model, messages, chat_template_kwargs: { enable_thinking: true } }
+```
+
+Swap the profile to `thinkingParams: (on) => ({ reasoning_effort: on ? 'high' : 'low' })` and the same `xinity.thinking: true` now produces the gpt-5 shape — no caller change.
+
+**2. Generic escape hatch — `extra_body` passthrough.** Any top-level JSON field on the request that isn't part of the OpenAI schema is forwarded verbatim to the upstream. The OpenAI SDKs' `extra_body` parameter flattens into top-level fields at the wire layer, so this works without any Prism config:
+
+```python
+client.chat.completions.create(
+    model="qwen3-30b",
+    messages=[...],
+    extra_body={
+        "top_k": 20,
+        "chat_template_kwargs": {"enable_thinking": True},
+    },
+)
+```
+
+Caller-supplied vendor fields win over profile-derived ones on overlap, so you can override `xinity.thinking` for a single request without changing the profile.
+
 ## What this is not
 
 This package is a focused proxy. It is intentionally **not**:

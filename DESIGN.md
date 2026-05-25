@@ -223,6 +223,15 @@ const ChatCompletionRequestSchema = z.object({
 
 Response and Chunk schemas similarly mirror OpenAI.
 
+`ChatCompletionRequestSchema` is declared `.passthrough()`. Unknown top-level
+fields — `top_k`, `chat_template_kwargs`, `reasoning_effort`, and other
+vendor-specific extensions that OpenAI SDKs flatten out of their `extra_body`
+parameter — survive validation and land on the internal `ChatRequest` under
+`extraBody` (§5.2). On the way out, `toWireRequest` spreads `extraBody` back
+into the wire payload before typed fields, so typed fields win on overlap.
+This is the gateway's generic forward-compatibility hatch: callers can pass
+arbitrary upstream params without a schema change.
+
 ### 5.2 Internal normalized format
 
 ```typescript
@@ -243,6 +252,13 @@ type ChatRequest = {
   seed?: number;
   // Non-OpenAI fields (used internally only)
   xinity?: XinityConfig;
+  /** Vendor-specific wire fields passed through verbatim — `top_k`,
+   *  `chat_template_kwargs`, `reasoning_effort`, etc. Populated by
+   *  `fromWireRequest` from any top-level field outside the OpenAI schema,
+   *  re-emitted by `toWireRequest` before typed fields. Typed fields win on
+   *  overlap; caller-supplied fields win over `ModelProfile.thinkingParams`
+   *  output (server.ts merge order). */
+  extraBody?: Record<string, unknown>;
 };
 ```
 
@@ -406,10 +422,29 @@ type ModelProfile = {
   contextWindow?: number;
   /** Optional override for default tokenizer (for chunk sizing). Defaults to tiktoken cl100k. */
   tokenizer?: 'cl100k' | 'o200k' | 'llama3';
+  /** Translate a per-request `xinity.thinking` toggle into provider-specific
+   *  wire fields. `server.ts` merges the return value into `request.extraBody`
+   *  before techniques run, and (when `on === true`) flips the request's
+   *  effective `thinkingMode` so the pipeline subsumption gate fires. Return
+   *  `undefined` when nothing needs to be added. */
+  thinkingParams?: (on: boolean) => Record<string, unknown> | undefined;
+  /** Whether `xinity.thinking` may be toggled per-request. Set to `false` for
+   *  models whose thinking behavior is hard-coded by training and cannot be
+   *  disabled. When `thinkingParams` is absent or this flag is `false`, a
+   *  request carrying `xinity.thinking` is rejected with 400
+   *  `thinking_not_supported` — see §16.5. */
+  thinkingModeToggleable?: boolean;
 };
 ```
 
 Resolution happens once per request in `model-profile.ts` and is passed via `TechniqueContext.modelProfile`.
+
+`thinkingMode` on the profile is the **default** for matched models. When a
+request sets `xinity.thinking`, `server.ts` shallow-clones the resolved profile
+with `thinkingMode = staged.thinking` for the lifetime of that request — the
+subsumption check at `pipeline.ts:96` and `selfConsistency`'s K-default at
+`techniques/self-consistency.ts:28` see the per-request value. The clone is
+local to the request; the registered profile is never mutated.
 
 ### 5.7 Verifier and EquivalenceScorer
 
@@ -470,6 +505,8 @@ Three sources, merged with this precedence (highest first):
    - `X-Xinity-Plugins: privacy,read-urls`
    - `X-Xinity-Disabled: <name>,<name>` — server-default opt-outs
    - `X-Xinity-Model-Profile: <name>` — override profile resolution
+   - `X-Xinity-Auto: plugins|none` — opt into the rules router for this request
+   - `X-Xinity-Thinking: true|false` — same effect as `xinity.thinking` in the body (§16.5). Strict, case-sensitive; `1`, `0`, `True`, `yes` etc. produce a 400 `invalid_xinity_header` rather than silent coercion.
    Escape hatch: `X-Xinity-Config: <base64 JSON>` is accepted for cases the mini-grammar can't express (deeply nested options). If both forms are present on the same request, the base64 form wins.
 2. **Body field** `xinity: {...}` — most ergonomic for SDK users
 3. **Model-name suffix** `model: "deepseek-r1@self-consistency:k=5"` — compat with OpenAI-SDK clients that can't add fields or headers
@@ -486,8 +523,21 @@ const XinityConfigSchema = z.object({
   plugins: z.array(z.union([z.string(), z.object({ name: z.string(), options: z.unknown() })])).optional(),
   modelProfile: z.string().optional(),                   // override profile resolution by name
   disabled: z.array(z.string()).optional(),              // server defaults to disable for this request
+  auto: z.enum(['plugins', 'none']).optional(),          // rules-router opt-in
+  thinking: z.boolean().optional(),                      // see §16.5
 }).strict();
 ```
+
+`auto`, `thinking`, `modelProfile`, and `disabled` use the same last-wins
+layering across all four sources (defaults < model-suffix < body < headers).
+`techniques` and `plugins` don't cross layers — a request layer that sets
+either field overrides the merged set wholesale.
+
+Outside of `xinity`, any non-OpenAI top-level field on the request body is
+captured into `ChatRequest.extraBody` by `fromWireRequest` (§5.1) and forwarded
+to the upstream verbatim. This is the path OpenAI SDK callers use when they
+pass `extra_body={...}`: the SDK flattens it into top-level JSON fields, the
+gateway captures, and the upstream sees them.
 
 When `techniques` is specified as bare strings, they're resolved against the techniques registered in `createGateway({ techniques })` map; this is the only "registry" in the system, and it's per-gateway-instance, not global.
 
@@ -924,5 +974,72 @@ A `requestId` is generated per request (UUID v7 if Bun supports natively, else v
 2. **No tokenizer dependency.** Memory chunking uses `text.length / 4` as an approximate token count — accurate enough for sizing chunks within a 70%-of-context budget. DeepConf consumes the upstream's own `logprobs` array (token-aligned by construction) and never needs a tokenizer. Config accepts an optional `tokenizer: (text: string) => number` injection point for users who want precision; default stays approximate.
 3. **Streaming conflict → quiet degrade.** When `stream: true` and any active technique has `supportsStreaming: false`, the gateway runs non-streaming, emits `xinity.*` progress events as SSE, then emits the final response as a single delta chunk + `[DONE]`. No strict mode in v1.
 4. **DeepConf upstream constraint.** Documented in the README. The capability gate (`requiresLogprobs && !modelProfile.supportsLogprobs → 400`) enforces it at request time; no further server-side handling needed.
+
+5. **Thinking mode: two surfaces, profile-translated, request-dynamic gate.**
+   Reasoning-server vendors disagree on the wire convention for thinking
+   (`chat_template_kwargs.enable_thinking` for Qwen3/vLLM, `reasoning_effort`
+   for gpt-5, a `thinking` block for Anthropic-compatible proxies). The
+   gateway exposes:
+
+   - **A typed flag:** `xinity.thinking: boolean` in the body, or
+     `X-Xinity-Thinking: true|false|1|0` as a header. Layered across all four
+     config sources like `auto`/`modelProfile`/`disabled` (defaults <
+     model-suffix < body < headers, last-wins).
+   - **A profile-side translator:** `ModelProfile.thinkingParams?: (on) =>
+     Record<string, unknown> | undefined` (§5.6). The server invokes it once
+     per request when `staged.thinking` is set, and merges the return value
+     into `request.extraBody` with **request-supplied fields winning over
+     profile output on overlap** — so a caller can override the profile's
+     translation for a single request without changing server config.
+   - **A request-dynamic pipeline gate:** when `staged.thinking === true`,
+     the resolved profile is shallow-cloned with `thinkingMode: true` before
+     the pipeline runs. This makes `pipeline.ts`'s `subsumedByThinkingMode`
+     skip and `selfConsistency`'s K-default reactive to per-request toggles,
+     not just static profile config.
+
+   **Effective-profile pattern (non-obvious, do not skip).** The registered
+   profile in `GatewayConfig.modelProfiles` is shared across all in-flight
+   requests. Per-request overrides — the `thinkingMode` flip above, and any
+   future request-scoped profile mutation — **must** be expressed as a
+   shallow-cloned local copy (`modelProfile = { ...modelProfile, ... }`),
+   not by mutating the registered object. Mutating the shared profile would
+   race across concurrent requests (request A's `xinity.thinking: false`
+   would leak into the in-flight request B that runs against the same
+   profile). All current call sites do this; new contributors adding
+   request-level profile derivations should follow the same pattern.
+
+   **Capability enforcement is loud, not silent.** A request that sets
+   `xinity.thinking` against a profile that cannot honor it — either because
+   `thinkingParams` is undefined, or because the profile explicitly sets
+   `thinkingModeToggleable: false` — is rejected with a 400
+   `thinking_not_supported` error naming the profile and the missing
+   capability. The failure-mode this guards is silent corruption in
+   ablation studies: without the check, a profile lacking `thinkingParams`
+   accepting `xinity.thinking: false` would flip the pipeline gate (subsumed
+   techniques skipped, K dropped) while the upstream still produces
+   thinking-on completions, because nothing in the wire payload told it
+   otherwise. Loud failure is mandatory; silent fallback would invalidate
+   benchmarks built on the assumption that thinking is controllable.
+
+   **Strict boolean parsing.** Both surfaces accept booleans only.
+   `xinity.thinking` in the body is `z.boolean()` — strings, numbers, and
+   other coercion attempts are rejected at Zod validation. The
+   `X-Xinity-Thinking` header accepts only `'true'` and `'false'`
+   (case-sensitive); `1`, `0`, `True`, `yes` etc. produce a 400
+   `invalid_xinity_header`. Strict over forgiving because different HTTP
+   clients use different conventions and silent coercion produces hard-to-
+   debug behavior asymmetric between header and body.
+
+   The first-class flag isn't a replacement for the generic passthrough — both
+   ship. Callers who want full control or whose vendor isn't covered by any
+   profile use `extra_body` directly; callers who want to abstract over
+   vendors set `xinity.thinking` and configure profiles once. Order of
+   operations in `server.ts`: resolve staged config → `fromWireRequest`
+   (captures wire passthrough into `extraBody`) → resolve profile → if
+   `staged.thinking` set, run the capability check, then merge
+   `profile.thinkingParams(on)` under `request.extraBody` (caller-supplied
+   `extraBody` fields win on overlap) and shallow-clone the profile with
+   `thinkingMode = true`. Fast-path passthrough preserves all of this
+   because `upstream.raw` re-serializes via `toWireRequest`.
 
 End of design.
