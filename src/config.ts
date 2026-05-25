@@ -22,6 +22,8 @@ export type ResolvedConfig = {
    * Undefined means "no auto-routing for this request" (the v0.1 default).
    */
   auto?: XinityAutoMode;
+  /** Per-request thinking-mode toggle (xinity.thinking). Layered like `auto`. */
+  thinking?: boolean;
 };
 
 export type ConfigSources = {
@@ -58,6 +60,7 @@ export function resolveConfig(sources: ConfigSources, registry: Registry): Resol
     if (layer.modelProfile !== undefined) merged.modelProfile = layer.modelProfile;
     if (layer.disabled !== undefined) merged.disabled = layer.disabled;
     if (layer.auto !== undefined) merged.auto = layer.auto;
+    if (layer.thinking !== undefined) merged.thinking = layer.thinking;
   }
 
   const disabled = new Set(merged.disabled ?? []);
@@ -74,6 +77,7 @@ export function resolveConfig(sources: ConfigSources, registry: Registry): Resol
     modelProfileName: merged.modelProfile,
     resolvedModel: fromModel.baseModel,
     ...(merged.auto !== undefined && { auto: merged.auto }),
+    ...(merged.thinking !== undefined && { thinking: merged.thinking }),
   };
 }
 
@@ -98,6 +102,8 @@ export type StagedConfig = {
   defaultTechniques: Technique[];
   disabled: string[];
   auto?: XinityAutoMode;
+  /** Resolved per-request thinking toggle (xinity.thinking). Last-wins layered. */
+  thinking?: boolean;
   modelProfileName?: string;
   resolvedModel: string;
 };
@@ -124,13 +130,15 @@ export function resolveConfigStaged(sources: ConfigSources, registry: Registry):
     if (layer.techniques !== undefined) explicitTechniquesRaw = layer.techniques;
   }
 
-  // For modelProfile, auto, disabled: full last-wins layering including defaults.
+  // For modelProfile, auto, thinking, disabled: full last-wins layering including defaults.
   let modelProfile: string | undefined = defaultsLayer.modelProfile;
   let auto: XinityAutoMode | undefined = defaultsLayer.auto;
+  let thinking: boolean | undefined = defaultsLayer.thinking;
   let disabled: string[] = defaultsLayer.disabled ?? [];
   for (const layer of requestLayers) {
     if (layer.modelProfile !== undefined) modelProfile = layer.modelProfile;
     if (layer.auto !== undefined) auto = layer.auto;
+    if (layer.thinking !== undefined) thinking = layer.thinking;
     if (layer.disabled !== undefined) disabled = layer.disabled;
   }
 
@@ -153,6 +161,7 @@ export function resolveConfigStaged(sources: ConfigSources, registry: Registry):
     defaultTechniques,
     disabled,
     ...(auto !== undefined && { auto }),
+    ...(thinking !== undefined && { thinking }),
     ...(modelProfile !== undefined && { modelProfileName: modelProfile }),
     resolvedModel: fromModel.baseModel,
   };
@@ -243,7 +252,21 @@ function parseHeaders(headers: Record<string, string | undefined>): XinityConfig
   if (profile) result.modelProfile = profile.trim();
   const auto = headers['x-xinity-auto'];
   if (auto) result.auto = parseAutoValue(auto.trim());
+  const thinking = headers['x-xinity-thinking'];
+  if (thinking) result.thinking = parseBooleanValue('X-Xinity-Thinking', thinking.trim());
   return result;
+}
+
+function parseBooleanValue(name: string, raw: string): boolean {
+  // Strict: no coercion of '1'/'0'/'yes'/'no'. Different HTTP clients use
+  // different conventions; silent coercion produces confusing behavior.
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  throw new GatewayError(
+    400,
+    'invalid_xinity_header',
+    `${name} must be 'true' or 'false' (case-sensitive), got '${raw}'`,
+  );
 }
 
 function parseAutoValue(raw: string): XinityAutoMode {

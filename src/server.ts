@@ -99,9 +99,40 @@ export function createGateway(config: GatewayConfig): Gateway {
       return errorToResponse(err);
     }
 
-    const internalReq = fromWireRequest({ ...wireReq, model: staged.resolvedModel });
-    const modelProfile = resolveModelProfile(staged.resolvedModel, profiles, staged.modelProfileName);
+    let internalReq = fromWireRequest({ ...wireReq, model: staged.resolvedModel });
+    let modelProfile = resolveModelProfile(staged.resolvedModel, profiles, staged.modelProfileName);
     const wantsStream = wireReq.stream === true;
+
+    // Per-request thinking toggle. Loud-fail when the profile can't satisfy it:
+    // a silent no-op would corrupt ablation studies (gate flipped but upstream
+    // still thinks because nothing in the wire payload told it not to).
+    if (staged.thinking !== undefined) {
+      if (
+        modelProfile.thinkingModeToggleable === false ||
+        modelProfile.thinkingParams === undefined
+      ) {
+        const profileName = modelProfile.name ?? staged.resolvedModel;
+        const reason = modelProfile.thinkingModeToggleable === false
+          ? 'thinkingModeToggleable is false'
+          : 'thinkingParams is not defined';
+        return openaiError(
+          400,
+          'thinking_not_supported',
+          `model profile '${profileName}' cannot honor xinity.thinking: ${reason}. Configure thinkingParams on the profile or remove xinity.thinking from the request.`,
+        );
+      }
+      const params = modelProfile.thinkingParams(staged.thinking);
+      if (params && Object.keys(params).length > 0) {
+        internalReq = {
+          ...internalReq,
+          // Request-set fields win over profile-supplied ones on overlap.
+          extraBody: { ...params, ...(internalReq.extraBody ?? {}) },
+        };
+      }
+      if (staged.thinking && !modelProfile.thinkingMode) {
+        modelProfile = { ...modelProfile, thinkingMode: true };
+      }
+    }
 
     const routerWillRun = router !== undefined && staged.auto === 'plugins';
     const v01Effective = effectiveV01Final(staged);
@@ -113,6 +144,7 @@ export function createGateway(config: GatewayConfig): Gateway {
       plugins: v01Effective.transforms.map(t => t.name),
       stream: wantsStream,
       ...(staged.auto !== undefined && { auto: staged.auto }),
+      ...(staged.thinking !== undefined && { thinking: staged.thinking }),
       ...(routerWillRun && { routerEnabled: true }),
     });
 

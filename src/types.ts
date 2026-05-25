@@ -80,6 +80,15 @@ export const XinityConfigSchema = z
     modelProfile: z.string().optional(),
     disabled: z.array(z.string()).optional(),
     auto: XinityAutoSchema.optional(),
+    /**
+     * Request-level thinking-mode toggle. When `true`, the resolved
+     * {@link ModelProfile.thinkingParams} hook (if any) produces a bag of wire
+     * fields merged into the upstream payload — e.g. for Qwen3 via vLLM,
+     * `{ chat_template_kwargs: { enable_thinking: true } }`. The pipeline also
+     * treats the model as thinking-mode for that request: techniques marked
+     * `subsumedByThinkingMode` are skipped and self-consistency drops k.
+     */
+    thinking: z.boolean().optional(),
   })
   .strict();
 
@@ -208,6 +217,7 @@ export type XinityConfig = {
   modelProfile?: string;
   disabled?: string[];
   auto?: XinityAutoMode;
+  thinking?: boolean;
 };
 
 export type ChatRequest = {
@@ -230,6 +240,13 @@ export type ChatRequest = {
   seed?: number;
   user?: string;
   xinity?: XinityConfig;
+  /**
+   * Arbitrary vendor-specific wire fields forwarded verbatim to the upstream
+   * (e.g. `top_k`, `chat_template_kwargs`, `reasoning_effort`). Captured from
+   * unknown top-level fields on the wire, and shallow-merged back on the way
+   * out — known {@link ChatRequest} fields take precedence on overlap.
+   */
+  extraBody?: Record<string, unknown>;
 };
 
 export type Logprob = {
@@ -292,7 +309,20 @@ export type ChatChunk = {
 // Wire <-> internal conversions
 // =============================================================================
 
+/** Wire field names the schema explicitly models; anything else flows through `extraBody`. */
+const KNOWN_WIRE_REQUEST_KEYS = new Set([
+  'model', 'messages', 'temperature', 'top_p', 'n', 'stream', 'stop',
+  'max_tokens', 'max_completion_tokens', 'presence_penalty', 'frequency_penalty',
+  'logprobs', 'top_logprobs', 'response_format', 'tools', 'tool_choice',
+  'seed', 'user', 'xinity',
+]);
+
 export function fromWireRequest(wire: WireChatCompletionRequest): ChatRequest {
+  const extraBody: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(wire)) {
+    if (KNOWN_WIRE_REQUEST_KEYS.has(key)) continue;
+    extraBody[key] = value;
+  }
   return {
     model: wire.model,
     messages: wire.messages.map(fromWireMessage),
@@ -313,14 +343,15 @@ export function fromWireRequest(wire: WireChatCompletionRequest): ChatRequest {
     seed: wire.seed,
     user: wire.user,
     xinity: wire.xinity,
+    ...(Object.keys(extraBody).length > 0 && { extraBody }),
   };
 }
 
 export function toWireRequest(req: ChatRequest): WireChatCompletionRequest {
-  const out: Record<string, unknown> = {
-    model: req.model,
-    messages: req.messages.map(toWireMessage),
-  };
+  // Spread extras first so known fields below win on overlap.
+  const out: Record<string, unknown> = { ...(req.extraBody ?? {}) };
+  out.model = req.model;
+  out.messages = req.messages.map(toWireMessage);
   if (req.temperature !== undefined) out.temperature = req.temperature;
   if (req.topP !== undefined) out.top_p = req.topP;
   if (req.n !== undefined) out.n = req.n;
@@ -510,6 +541,35 @@ export type ModelProfile = {
   supportsLogprobs: boolean;
   /** Optional context window (in tokens). Used by Memory to decide when to chunk. */
   contextWindow?: number;
+  /**
+   * Translate a per-request thinking toggle into provider-specific wire fields
+   * merged into the request's `extraBody`. Lets a generic `xinity.thinking: true`
+   * become e.g. `chat_template_kwargs: { enable_thinking: true }` (Qwen3/vLLM)
+   * or `reasoning_effort: 'high'` (gpt-5). Return `undefined` when nothing to add.
+   *
+   * Required when the profile claims `thinkingModeToggleable: true`. A request
+   * with `xinity.thinking` set against a profile without this hook (and not
+   * explicitly toggleable) is rejected with `thinking_not_supported` rather
+   * than silently no-ops — see {@link thinkingModeToggleable}.
+   */
+  thinkingParams?: (on: boolean) => Record<string, unknown> | undefined;
+  /**
+   * Whether `xinity.thinking` may be toggled per-request for this profile.
+   *
+   *   - `true` (or omitted, when `thinkingParams` is defined): the gateway
+   *     calls `thinkingParams(on)` and merges its output.
+   *   - `false`: requests with `xinity.thinking` are rejected with a 400
+   *     `thinking_not_supported` error, even if `thinkingParams` exists.
+   *     Use this for models where thinking is hard-coded by the training
+   *     recipe and cannot be turned off (e.g. some pure-reasoning checkpoints).
+   *
+   * The failure-mode this guards is silent corruption: a profile without
+   * `thinkingParams` accepting `xinity.thinking: false` would flip the pipeline
+   * gate (techniques skipped, K dropped) while the upstream still thinks,
+   * because nothing in the wire payload told it not to. Ablation studies and
+   * thinking-vs-non-thinking benchmarks rely on the loud-failure semantics.
+   */
+  thinkingModeToggleable?: boolean;
 };
 
 // =============================================================================
