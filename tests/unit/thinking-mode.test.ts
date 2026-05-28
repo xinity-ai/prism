@@ -31,17 +31,27 @@ describe('wire <-> internal: extraBody passthrough', () => {
       messages: [{ role: 'user', content: 'hi' }],
       top_k: 20,
       chat_template_kwargs: { enable_thinking: true },
-      reasoning_effort: 'high',
     });
     const internal = fromWireRequest(parsed);
     expect(internal.extraBody).toEqual({
       top_k: 20,
       chat_template_kwargs: { enable_thinking: true },
-      reasoning_effort: 'high',
     });
     // Known fields are NOT mirrored into extraBody.
     expect(internal.extraBody!.model).toBeUndefined();
     expect(internal.extraBody!.messages).toBeUndefined();
+  });
+
+  test('reasoning_effort is a known field, not extraBody passthrough', () => {
+    // reasoning_effort is consumed by the gateway boundary (translated to the
+    // thinking toggle) and must never appear on the upstream wire.
+    const parsed = ChatCompletionRequestSchema.parse({
+      model: 'qwen3',
+      messages: [{ role: 'user', content: 'hi' }],
+      reasoning_effort: 'high',
+    });
+    const internal = fromWireRequest(parsed);
+    expect(internal.extraBody).toBeUndefined();
   });
 
   test('toWireRequest spreads extraBody and known fields override on overlap', () => {
@@ -73,7 +83,6 @@ describe('wire <-> internal: extraBody passthrough', () => {
       max_tokens: 256,
       top_k: 20,
       chat_template_kwargs: { enable_thinking: true },
-      reasoning_effort: 'high',
     };
     const parsed = ChatCompletionRequestSchema.parse(original);
     const internal = fromWireRequest(parsed);
@@ -505,5 +514,123 @@ describe('CLI Qwen3 profile registration', () => {
       }));
       expect(resp.status).toBe(200);
     }
+  });
+});
+
+describe('server: reasoning_effort → thinking translation', () => {
+  // OpenAI-style reasoning_effort is consumed at the gateway boundary and
+  // mapped to the boolean thinking toggle (minimal → off; low/medium/high →
+  // on), then fed through the profile's thinkingParams. The field itself
+  // must never appear on the upstream wire — Qwen3/vLLM doesn't honor it and
+  // would just clutter the payload.
+  const qwen3Profile: ModelProfile = {
+    name: 'qwen3',
+    match: /^qwen3/i,
+    thinkingMode: true,
+    thinkingModeToggleable: true,
+    supportsLogprobs: false,
+    contextWindow: 32_000,
+    thinkingParams: (on) => ({ chat_template_kwargs: { enable_thinking: on } }),
+  };
+
+  function buildGateway() {
+    let capturedBody: Record<string, unknown> | null = null;
+    const upstream = createMockUpstream({
+      raw: async (req) => {
+        capturedBody = toWireRequest(req) as Record<string, unknown>;
+        return new Response('{"id":"x","choices":[]}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+    const gw = createGateway({
+      upstream,
+      logger: silentLogger,
+      modelProfiles: [qwen3Profile],
+    });
+    return { gw, captured: () => capturedBody };
+  }
+
+  async function send(gw: ReturnType<typeof createGateway>, body: Record<string, unknown>) {
+    return gw.fetch(new Request('http://x/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'qwen3.6-35b-a3b-fp8',
+        messages: [{ role: 'user', content: 'hi' }],
+        ...body,
+      }),
+    }));
+  }
+
+  for (const effort of ['low', 'medium', 'high'] as const) {
+    test(`reasoning_effort:${effort} → enable_thinking:true on the wire`, async () => {
+      const { gw, captured } = buildGateway();
+      const resp = await send(gw, { reasoning_effort: effort });
+      expect(resp.status).toBe(200);
+      expect(captured()!.chat_template_kwargs).toEqual({ enable_thinking: true });
+      // Must not be forwarded upstream.
+      expect(captured()!.reasoning_effort).toBeUndefined();
+    });
+  }
+
+  test('reasoning_effort:minimal → enable_thinking:false on the wire', async () => {
+    const { gw, captured } = buildGateway();
+    const resp = await send(gw, { reasoning_effort: 'minimal' });
+    expect(resp.status).toBe(200);
+    expect(captured()!.chat_template_kwargs).toEqual({ enable_thinking: false });
+    expect(captured()!.reasoning_effort).toBeUndefined();
+  });
+
+  test('reasoning_effort wins when both reasoning_effort and xinity.thinking are set', async () => {
+    const { gw, captured } = buildGateway();
+    // reasoning_effort:minimal would yield false, while xinity.thinking:true
+    // would yield true. reasoning_effort wins, so the wire should be false.
+    const resp = await send(gw, { reasoning_effort: 'minimal', xinity: { thinking: true } });
+    expect(resp.status).toBe(200);
+    expect(captured()!.chat_template_kwargs).toEqual({ enable_thinking: false });
+  });
+
+  test('reasoning_effort rejects values outside the OpenAI enum', async () => {
+    const { gw } = buildGateway();
+    const resp = await send(gw, { reasoning_effort: 'extreme' });
+    expect(resp.status).toBe(400);
+    const body = await resp.json() as { error: { code: string } };
+    expect(body.error.code).toBe('invalid_request');
+  });
+
+  test('reasoning_effort against a profile without thinkingParams is rejected loudly', async () => {
+    // Same loud-failure contract as xinity.thinking: a silent no-op would
+    // corrupt ablation studies that depend on the gate flipping.
+    const noThinkingProfile: ModelProfile = {
+      name: 'plain',
+      match: /.*/,
+      thinkingMode: false,
+      supportsLogprobs: false,
+    };
+    const upstream = createMockUpstream({
+      raw: async () => new Response('{}', {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    });
+    const gw = createGateway({
+      upstream,
+      logger: silentLogger,
+      modelProfiles: [noThinkingProfile],
+    });
+    const resp = await gw.fetch(new Request('http://x/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: 'hi' }],
+        reasoning_effort: 'high',
+      }),
+    }));
+    expect(resp.status).toBe(400);
+    const body = await resp.json() as { error: { code: string } };
+    expect(body.error.code).toBe('thinking_not_supported');
   });
 });

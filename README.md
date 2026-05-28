@@ -190,6 +190,8 @@ createGateway({
 
 Both `xinity.thinking` (body) and `X-Xinity-Thinking` (header) accept booleans strictly — `true` / `false` only. The header is case-sensitive and rejects `1`, `0`, `yes`, `True`, etc. with a 400 rather than coercing.
 
+**OpenAI-style `reasoning_effort` is also accepted** as a top-level request field and translated at the gateway boundary into the same boolean toggle — `minimal` maps to off, `low`/`medium`/`high` map to on. The string is consumed by Prism (it is *not* forwarded upstream), and the resolved boolean flows through `thinkingParams` exactly as `xinity.thinking` does. When both `reasoning_effort` and `xinity.thinking` appear on the same request, `reasoning_effort` wins. This makes OpenAI-shape clients (and benchmark harnesses that ablate over `reasoning_effort`) work without explicit knowledge of the `xinity` namespace.
+
 ```python
 client.chat.completions.create(
     model="qwen3-30b",

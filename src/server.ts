@@ -87,11 +87,21 @@ export function createGateway(config: GatewayConfig): Gateway {
     }
     const wireReq = parsed.data;
 
+    // OpenAI-style reasoning_effort is consumed here and translated to the
+    // boolean thinking toggle: minimal → off; low/medium/high → on. It is NOT
+    // forwarded upstream (the schema marks it known, so it does not land in
+    // extraBody). When both reasoning_effort and xinity.thinking appear on the
+    // same request, reasoning_effort wins.
+    const reasoningEffort = wireReq.reasoning_effort;
+    const bodyXinity = reasoningEffort !== undefined
+      ? { ...(wireReq.xinity ?? {}), thinking: reasoningEffort !== 'minimal' }
+      : wireReq.xinity;
+
     let staged: StagedConfig;
     try {
       staged = resolveConfigStaged({
         model: wireReq.model,
-        body: wireReq.xinity,
+        body: bodyXinity,
         headers: headersToRecord(req.headers),
         defaults: config.defaults,
       }, registry);
@@ -145,6 +155,7 @@ export function createGateway(config: GatewayConfig): Gateway {
       stream: wantsStream,
       ...(staged.auto !== undefined && { auto: staged.auto }),
       ...(staged.thinking !== undefined && { thinking: staged.thinking }),
+      ...(reasoningEffort !== undefined && { reasoningEffort }),
       ...(routerWillRun && { routerEnabled: true }),
     });
 

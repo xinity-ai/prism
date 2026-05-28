@@ -113,6 +113,15 @@ export const ChatCompletionRequestSchema = z
     seed: z.number().int().optional(),
     user: z.string().optional(),
     xinity: XinityConfigSchema.optional(),
+    /**
+     * OpenAI-style reasoning-effort control. Consumed at the gateway boundary
+     * (NOT forwarded upstream): translated to the boolean thinking toggle and
+     * fed through the profile's {@link ModelProfile.thinkingParams} hook.
+     * Mapping: `minimal` → off; `low`/`medium`/`high` → on.
+     * When both `reasoning_effort` and `xinity.thinking` are set on the same
+     * request, `reasoning_effort` wins.
+     */
+    reasoning_effort: z.enum(['minimal', 'low', 'medium', 'high']).optional(),
   })
   .passthrough();
 
@@ -242,9 +251,11 @@ export type ChatRequest = {
   xinity?: XinityConfig;
   /**
    * Arbitrary vendor-specific wire fields forwarded verbatim to the upstream
-   * (e.g. `top_k`, `chat_template_kwargs`, `reasoning_effort`). Captured from
-   * unknown top-level fields on the wire, and shallow-merged back on the way
-   * out — known {@link ChatRequest} fields take precedence on overlap.
+   * (e.g. `top_k`, `chat_template_kwargs`). Captured from unknown top-level
+   * fields on the wire, and shallow-merged back on the way out — known
+   * {@link ChatRequest} fields take precedence on overlap. Note: OpenAI-style
+   * `reasoning_effort` is NOT a passthrough — it's consumed at the gateway
+   * boundary and translated to the profile's thinking toggle.
    */
   extraBody?: Record<string, unknown>;
 };
@@ -314,7 +325,7 @@ const KNOWN_WIRE_REQUEST_KEYS = new Set([
   'model', 'messages', 'temperature', 'top_p', 'n', 'stream', 'stop',
   'max_tokens', 'max_completion_tokens', 'presence_penalty', 'frequency_penalty',
   'logprobs', 'top_logprobs', 'response_format', 'tools', 'tool_choice',
-  'seed', 'user', 'xinity',
+  'seed', 'user', 'xinity', 'reasoning_effort',
 ]);
 
 export function fromWireRequest(wire: WireChatCompletionRequest): ChatRequest {
