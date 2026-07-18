@@ -16,6 +16,24 @@ export type ResolvedConfig = {
   modelProfileName?: string;
   /** The base model name with any @-suffix stripped. */
   resolvedModel: string;
+  /**
+   * v0.2 — true when techniques came from a per-request source (body,
+   * headers, or model-suffix). False when they came only from server defaults
+   * (or there are none). Server uses this to decide whether to consult the
+   * Router: explicit beats router.
+   */
+  techniquesFromRequest: boolean;
+  /**
+   * v0.2 — true when plugins came from a per-request source. False when only
+   * server defaults supplied them. Server uses this to decide whether to apply
+   * `shouldActivate` filtering: explicit plugins are never gated.
+   */
+  pluginsFromRequest: boolean;
+  /**
+   * v0.2 — merged effortBudget value (per-request layers override defaults).
+   * Undefined when no layer supplied it.
+   */
+  effortBudget?: number;
 };
 
 export type ConfigSources = {
@@ -38,12 +56,9 @@ export type ConfigSources = {
 export function resolveConfig(sources: ConfigSources, registry: Registry): ResolvedConfig {
   const fromModel = parseModelSuffix(sources.model);
   const fromHeaders = parseHeaders(sources.headers ?? {});
-  const layers: XinityConfig[] = [
-    sources.defaults ?? {},
-    fromModel.config,
-    sources.body ?? {},
-    fromHeaders,
-  ];
+  // Per-request layers, in precedence order (last wins on conflict).
+  const requestLayers: XinityConfig[] = [fromModel.config, sources.body ?? {}, fromHeaders];
+  const layers: XinityConfig[] = [sources.defaults ?? {}, ...requestLayers];
 
   const merged: XinityConfig = {};
   for (const layer of layers) {
@@ -51,6 +66,7 @@ export function resolveConfig(sources: ConfigSources, registry: Registry): Resol
     if (layer.plugins !== undefined) merged.plugins = layer.plugins;
     if (layer.modelProfile !== undefined) merged.modelProfile = layer.modelProfile;
     if (layer.disabled !== undefined) merged.disabled = layer.disabled;
+    if (layer.effortBudget !== undefined) merged.effortBudget = layer.effortBudget;
   }
 
   const disabled = new Set(merged.disabled ?? []);
@@ -61,11 +77,20 @@ export function resolveConfig(sources: ConfigSources, registry: Registry): Resol
     .filter(ref => !disabled.has(refName(ref)))
     .map(ref => instantiate(ref, registry.transforms, 'plugin'));
 
+  // Origin flags: any per-request source that supplied a non-empty list
+  // means the user was explicit. Empty arrays count as "supplied an explicit
+  // empty selection" — also explicit.
+  const techniquesFromRequest = requestLayers.some(l => l.techniques !== undefined);
+  const pluginsFromRequest = requestLayers.some(l => l.plugins !== undefined);
+
   return {
     techniques,
     transforms,
     modelProfileName: merged.modelProfile,
     resolvedModel: fromModel.baseModel,
+    techniquesFromRequest,
+    pluginsFromRequest,
+    ...(merged.effortBudget !== undefined && { effortBudget: merged.effortBudget }),
   };
 }
 

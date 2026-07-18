@@ -1,7 +1,7 @@
 {
   "name": "@xinity/prism",
-  "version": "0.1.0",
-  "description": "Prism — OpenAI-compatible optimizing inference proxy. Self-Consistency, Best-of-N, PlanSearch, RTO, Memory (WiM), DeepConf, plus privacy/readurls/json plugins.",
+  "version": "0.2.0",
+  "description": "Prism — OpenAI-compatible optimizing inference proxy. Self-Consistency, Best-of-N, PlanSearch, RTO, Memory (WiM), DeepConf, plus privacy/readurls/json plugins and a pluggable rule-based router.",
   "keywords": [
     "llm",
     "openai",

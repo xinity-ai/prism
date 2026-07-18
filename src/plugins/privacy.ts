@@ -1,6 +1,18 @@
 import { defaultDetector, type Detector, type PiiEntityType, type PiiMatch } from '../internal/pii-detector.ts';
 import type { ChatChunk, ChatRequest, ChatResponse, Message, Transform, TransformState } from '../types.ts';
 
+function containsPii(messages: readonly Message[], detect: Detector): boolean {
+  for (const m of messages) {
+    if (m.role !== 'user') continue;
+    if (m.content == null) continue;
+    const text = typeof m.content === 'string'
+      ? m.content
+      : m.content.map(p => (p.type === 'text' ? p.text : '')).join('\n');
+    if (text && detect(text).length > 0) return true;
+  }
+  return false;
+}
+
 export type PrivacyOptions = {
   /** Override the default regex-based detector. */
   detector?: Detector;
@@ -23,6 +35,10 @@ export function privacy(options: PrivacyOptions = {}): Transform {
 
   return {
     name: 'privacy',
+
+    shouldActivate(request) {
+      return containsPii(request.messages, detect);
+    },
 
     async pre(request, state) {
       const mapping = ensureMapping(state);

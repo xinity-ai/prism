@@ -70,7 +70,7 @@ Bun gives us native `fetch`, `Bun.serve`, native SQLite, and a built-in test run
 
 ## Quickstart
 
-> Requires **Bun ≥ 1.3**. Node compatibility is on the v0.2 roadmap.
+> Requires **Bun ≥ 1.3**. Node compatibility is on the v0.3 roadmap.
 
 ### As a server
 
@@ -156,6 +156,130 @@ X-Xinity-Plugins: privacy,read-urls
 
 For nested option payloads the mini-grammar cannot express, send a base64-encoded JSON config in `X-Xinity-Config`.
 
+## Routing (v0.2)
+
+By default Prism still runs only what you ask it to. v0.2 adds two opt-in mechanisms for automatic selection, deliberately kept independent:
+
+1. **A `Router`** that picks **techniques** based on the request shape.
+2. **Auto-activating plugins** whose own `shouldActivate` predicate decides whether they belong in the chain.
+
+The two mechanisms don't share state and don't talk to each other. Plugins self-activate on structural triggers (PII present, URLs present, schema present). The Router makes a judgmental decision about which inference-time techniques to apply. Both can be on, off, or mixed per request.
+
+### Rule-based router
+
+The shipped router is a simple `Router` over a list of `Rule`s. Each rule is a name, a sync predicate, and a decision-producer:
+
+```typescript
+import { createGateway, rulesRouter, defaultRules } from '@xinity/prism';
+
+createGateway({
+  upstream: { baseUrl: 'http://localhost:11434/v1' },
+  router: rulesRouter(defaultRules),
+});
+```
+
+The four `defaultRules` cover the obvious cases:
+
+| Rule | Fires when | Adds |
+|---|---|---|
+| `memory-for-long-input` | input > 70% of the model's context window | `memory({})` |
+| `plan-search-for-code` | code-generation prompt detected AND `effortBudget ≥ 0.4` | `planSearch({ numPlans: 5 })`, paired with the `unit-test` verifier if registered |
+| `round-trip-for-translation-or-summary` | translate/summarize intent detected (EN/DE/FR/IT/ES) | `roundTrip({})` |
+| `self-consistency-default` | `effortBudget ≥ 0.3` | `selfConsistency({ k })` — `k` adapts: low budget → 2, thinking-mode → 3, otherwise 5 |
+
+Rules compose **additively**. A long-document code request matches three rules and gets `[memory, planSearch, selfConsistency]`. There are no priorities, no rule-disables-rule mechanic, no async predicates — the simplicity is deliberate (see `DESIGN.md` §17.4.1).
+
+You can extend or replace the default set:
+
+```typescript
+import { rulesRouter, defaultRules, rule, bestOfN } from '@xinity/prism';
+
+router: rulesRouter([
+  ...defaultRules,
+  rule({
+    name: 'medical-domain-best-of-n',
+    when: ({ request }) => /\b(patient|diagnosis|dosage)\b/i.test(JSON.stringify(request.messages)),
+    apply: ({ verifiers }) => ({ techniques: [bestOfN({ n: 5, verifier: verifiers.get('medical-judge')! })] }),
+  }),
+]);
+```
+
+The optional per-request `xinity.effortBudget` (0..1) is forwarded to the router as `RouterContext.effortBudget`. The default rules use it to gate the more expensive techniques.
+
+### Merge semantics — explicit beats router
+
+```
+xinity.techniques in request?    router configured?    behavior              log event
+─────────────────────────────────────────────────────────────────────────────────────────
+yes (incl. empty array)          yes                   explicit used          router.bypassed
+yes (incl. empty array)          no                    explicit used          (none)
+no                               yes                   router decides         router.decision
+no                               no                    server defaults used   router.fallback
+```
+
+If you set `xinity.techniques` on a request, the router never runs for it. Period. The same applies to `xinity.plugins`: explicit plugins always bypass auto-activation.
+
+### Auto-activating plugins
+
+```typescript
+createGateway({
+  upstream: { baseUrl: 'http://localhost:11434/v1' },
+  autoActivatePlugins: true,
+  defaults: { plugins: ['privacy', 'read-urls', 'json'] },
+});
+```
+
+When `autoActivatePlugins: true` AND the request did not supply its own plugin list, each default plugin's `shouldActivate(request, modelProfile)` is consulted. Plugins without a `shouldActivate` predicate are always included. Per-request explicit plugins are never gated.
+
+The three core plugins ship with these predicates:
+
+| Plugin | Activates when |
+|---|---|
+| `privacy()` | the PII detector finds matches in any user-role message |
+| `readUrls()` | a user-role message contains an `http(s)://` URL |
+| `json({ schema })` | `response_format` is `json_schema`/`json_object`, or a schema was provided at construction (the typical case → effectively always on) |
+
+Every decision emits a structured log line: `plugin.auto-activated` / `plugin.auto-skipped` per plugin, `router.decision` / `router.bypassed` / `router.fallback` per request, plus `router.init` / `router.close` for lifecycle.
+
+### Composition — `composeRouters`
+
+Hybrid routing is just a combinator:
+
+```typescript
+import { composeRouters, rulesRouter, rule, memory } from '@xinity/prism';
+
+router: composeRouters([
+  someOtherRouter,
+  rulesRouter([
+    // Always wrap in memory for long inputs, regardless of what the primary said
+    rule({
+      name: 'memory-override',
+      when: ({ request, modelProfile }) =>
+        request.messages.reduce((n, m) => n + (typeof m.content === 'string' ? m.content.length : 0), 0)
+        > 0.7 * (modelProfile.contextWindow ?? 32_000),
+      apply: () => ({ techniques: [memory({})] }),
+    }),
+  ]),
+]);
+```
+
+Composed routers run their children in parallel, concatenate techniques in order, join reason strings, and take the minimum confidence across any children that report one. `init` and `close` propagate to all children.
+
+### Coming in v0.3: semantic router
+
+A separately published package, **`@xinity/prism-router-semantic`**, will implement the same `Router` interface with a ModernBERT-based classifier. ONNX Runtime and tokenizer dependencies live in that package so core `@xinity/prism` users don't pay for them. It will compose with the rule-based router via `composeRouters` — no breaking change to v0.2 code expected.
+
+```typescript
+// v0.3 preview (not yet published)
+import { semanticRouter } from '@xinity/prism-router-semantic';
+import { composeRouters, rulesRouter, defaultRules } from '@xinity/prism';
+
+router: composeRouters([
+  semanticRouter({ model: 'modernbert-large' }),
+  rulesRouter(defaultRules), // structural overrides on top of the classifier
+]);
+```
+
 ## What this is not
 
 This package is a focused proxy. It is intentionally **not**:
@@ -164,7 +288,6 @@ This package is a focused proxy. It is intentionally **not**:
 - An auth, rate-limiting, or quota system
 - An observability backend (it writes structured JSON to stderr; pipe it where you want)
 - A multi-tenant control plane
-- A router that picks techniques for you
 - A reimplementation of every optillm technique, only the v1 set above (MCTS, MoA, CoT-Decoding, AutoThink, rStar, CePO and friends are out of scope; see *Why only six techniques* above)
 - A code sandbox (the `executeCode` slot is a v1 stub awaiting a sandbox runner)
 

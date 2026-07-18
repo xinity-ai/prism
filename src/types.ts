@@ -70,6 +70,8 @@ export const XinityConfigSchema = z
     plugins: z.array(XinityTechniqueRefSchema).optional(),
     modelProfile: z.string().optional(),
     disabled: z.array(z.string()).optional(),
+    // v0.2: cost/quality knob in [0, 1] consumed by the Router.
+    effortBudget: z.number().min(0).max(1).optional(),
   })
   .strict();
 
@@ -195,6 +197,8 @@ export type XinityConfig = {
   plugins?: XinityTechniqueRef[];
   modelProfile?: string;
   disabled?: string[];
+  /** v0.2: cost/quality knob in [0, 1] passed to the Router. */
+  effortBudget?: number;
 };
 
 export type ChatRequest = {
@@ -553,6 +557,13 @@ export type Transform = {
   pre?(request: ChatRequest, state: TransformState): Promise<ChatRequest>;
   post?(response: ChatResponse, state: TransformState): Promise<ChatResponse>;
   postChunk?(chunk: ChatChunk, state: TransformState): Promise<ChatChunk>;
+  /**
+   * v0.2: optional predicate for auto-activation. When the gateway runs with
+   * `autoActivatePlugins: true` AND the request did not supply plugins
+   * explicitly, the pipeline calls this on every request and includes the
+   * plugin in the chain only if it returns true. Absent → always included.
+   */
+  shouldActivate?(request: ChatRequest, modelProfile: ModelProfile): boolean;
 };
 
 // =============================================================================
@@ -573,6 +584,18 @@ export type Voter = {
   readonly name: string;
   vote(candidates: ChatResponse[]): { winner: ChatResponse; distribution: Record<string, number> };
 };
+
+/**
+ * Lookup table for named verifiers, passed to rules so a rule can pair a
+ * verifier with the technique it produces (e.g., planSearch + unit-test).
+ * Rules MUST tolerate `get` returning undefined and let the technique fall
+ * back to its default behavior.
+ */
+export interface VerifierRegistry {
+  get(name: string): Verifier | undefined;
+  has(name: string): boolean;
+  names(): string[];
+}
 
 // =============================================================================
 // Errors

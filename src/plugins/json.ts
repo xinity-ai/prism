@@ -29,6 +29,17 @@ export function json(options: JsonOptions): Transform {
 
   return {
     name: 'json',
+    shouldActivate(request) {
+      // Per DESIGN §17.8.2: activate when the request asks for structured JSON
+      // OR a schema was passed at construction time (always-JSON intent).
+      // Schema is required in v0.2, so this resolves to `true` whenever the
+      // plugin is registered — explicit by design.
+      return Boolean(
+        request.responseFormat?.type === 'json_schema' ||
+        request.responseFormat?.type === 'json_object' ||
+        options.schema,
+      );
+    },
     async pre(request, state) {
       if (request.stream) {
         state.logger.warn({ event: 'json.stream-disabled', message: 'json plugin forces stream:false' });
